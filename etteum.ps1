@@ -9,6 +9,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Add-PathOnce([string]$dir) {
+  if (-not (Test-Path $dir)) { return }
+  $current = $env:Path -split ';'
+  if ($current -notcontains $dir) {
+    $env:Path = "$dir;$env:Path"
+  }
+}
+
+# Auto-detect Bun in Winget package folder or default folders
+if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+  $wingetDir = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+  if (Test-Path $wingetDir) {
+    $bunFolders = Get-ChildItem -Path $wingetDir -Filter "Oven-sh.Bun*" -Directory -ErrorAction SilentlyContinue
+    foreach ($folder in $bunFolders) {
+      $binPath = Join-Path $folder.FullName "bun-windows-x64"
+      if (Test-Path $binPath) {
+        Add-PathOnce $binPath
+      }
+    }
+  }
+  Add-PathOnce (Join-Path $HOME ".bun\bin")
+  Add-PathOnce (Join-Path $env:USERPROFILE ".bun\bin")
+}
+
+
 # Auto-detect project dir: env override > script dir
 if ($env:POOLPROX_HOME -and (Test-Path $env:POOLPROX_HOME)) {
   $ProjectDir = $env:POOLPROX_HOME
@@ -61,9 +86,8 @@ function Invoke-Start {
   }
 
   Write-Host "Starting Etteum..."
-  $proc = Start-Process -FilePath "bun" -ArgumentList "scripts/production.ts","--skip-build" `
-    -WorkingDirectory $ProjectDir -RedirectStandardOutput $LogFile -RedirectStandardError $LogFile `
-    -WindowStyle Hidden -PassThru
+  $proc = Start-Process -FilePath "cmd" -ArgumentList "/c bun scripts/production.ts --skip-build > `"$LogFile`" 2>&1" `
+    -WorkingDirectory $ProjectDir -WindowStyle Hidden -PassThru
   $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
   Start-Sleep -Seconds 1
 

@@ -186,6 +186,12 @@ const server = Bun.serve({
     const response = await app.fetch(req, { ip: server.requestIP(req) });
     if (response.status !== 404) return response;
 
+    // Only allow GET/HEAD requests to fall back to static files and dashboard SPA routing.
+    // Serving files for POST/other requests can crash Bun runtime on Windows.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return response;
+    }
+
     // Fallback: serve dashboard static files
     const pathname = url.pathname;
     const filePath = `${dashboardDist}${pathname}`;

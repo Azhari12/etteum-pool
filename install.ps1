@@ -2,7 +2,7 @@
 #
 # This is the private repo's installer. It mirrors install.ps1 in the public
 # repo but defaults to the private repo URL. The private build includes extra
-# providers (gitlab-duo, youmind) — installer flow is identical.
+# providers (gitlab-duo, youmind) - installer flow is identical.
 #
 # One-command install (requires SSH key configured for the private repo):
 #   irm https://raw.githubusercontent.com/priyo000/etteum/main/install.ps1 | iex
@@ -12,7 +12,7 @@
 #
 # Environment variables (all optional):
 #   $env:ETTEUM_HOME          Install directory (default: $HOME\etteum-pool)
-#   $env:ETTEUM_REPO          Repo URL (default: github.com/priyo000/etteum — PRIVATE)
+#   $env:ETTEUM_REPO          Repo URL (default: github.com/priyo000/etteum - PRIVATE)
 #   $env:ETTEUM_YES = "1"     Skip confirmation (CI / unattended)
 #   $env:ETTEUM_BRANCH        Branch to clone (default: main)
 #   $env:ETTEUM_NO_CLI = "1"  Skip the etteum CLI in ~\.local\bin
@@ -35,7 +35,7 @@ function Ok  ([string]$msg) { Write-Host "ok  " -ForegroundColor Green -NoNewlin
 
 function Have([string]$cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
-# Refresh PATH from registry — winget/scoop/choco may have updated it
+# Refresh PATH from registry - winget/scoop/choco may have updated it
 function Refresh-Path {
     $machine = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
     $user    = [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -89,7 +89,7 @@ function Retry-Action {
 function Show-Summary {
     Write-Host ""
     Write-Host "Etteum Pool" -ForegroundColor Cyan -NoNewline
-    Write-Host " — AI Proxy Pool for Multiple Providers"
+    Write-Host " - AI Proxy Pool for Multiple Providers"
     Write-Host ""
 
     $needsGit = -not (Have git)
@@ -106,17 +106,17 @@ function Show-Summary {
     $totalSize = 0
     $items = @()
 
-    if ($needsGit)    { $items += "  • Git                          ~50 MB";  $totalSize += 50  }
-    if ($needsBun)    { $items += "  • Bun runtime                  ~50 MB";  $totalSize += 50  }
-    if ($needsPython) { $items += "  • Python 3.10+                 ~100 MB"; $totalSize += 100 }
+    if ($needsGit)    { $items += "  * Git                          ~50 MB";  $totalSize += 50  }
+    if ($needsBun)    { $items += "  * Bun runtime                  ~50 MB";  $totalSize += 50  }
+    if ($needsPython) { $items += "  * Python 3.10+                 ~100 MB"; $totalSize += 100 }
 
-    $items += "  • Node.js dependencies         ~200 MB"; $totalSize += 200
-    $items += "  • Python packages (venv)       ~150 MB"; $totalSize += 150
+    $items += "  * Node.js dependencies         ~200 MB"; $totalSize += 200
+    $items += "  * Python packages (venv)       ~150 MB"; $totalSize += 150
     if ($env:ETTEUM_SKIP_BROWSERS -ne "1") {
-        $items += "  • Playwright Chromium          ~175 MB"; $totalSize += 175
-        $items += "  • Camoufox browser             ~150 MB"; $totalSize += 150
+        $items += "  * Playwright Chromium          ~175 MB"; $totalSize += 175
+        $items += "  * Camoufox browser             ~150 MB"; $totalSize += 150
     }
-    $items += "  • Dashboard build              ~50 MB";  $totalSize += 50
+    $items += "  * Dashboard build              ~50 MB";  $totalSize += 50
 
     Write-Host "This will install:" -ForegroundColor White
     foreach ($item in $items) { Write-Host $item }
@@ -134,13 +134,13 @@ function Show-Summary {
     }
 
     if ($AssumeYes) {
-        Write-Host "ETTEUM_YES=1 set — skipping confirmation." -ForegroundColor DarkGray
+        Write-Host "ETTEUM_YES=1 set - skipping confirmation." -ForegroundColor DarkGray
         Write-Host ""
         return
     }
 
     if (-not [Environment]::UserInteractive) {
-        Write-Host "Non-interactive shell — proceeding automatically." -ForegroundColor DarkGray
+        Write-Host "Non-interactive shell - proceeding automatically." -ForegroundColor DarkGray
         Write-Host ""
         return
     }
@@ -168,13 +168,11 @@ function Ensure-PackageManager {
         }
         Ok "Scoop installed"
     } catch {
-        Fail @"
-No package manager (winget / scoop / choco) was found and Scoop install failed.
-Install one of these manually, then re-run:
-  • winget  — built into Windows 10/11; update from Microsoft Store
-  • scoop   — https://scoop.sh
-  • choco   — https://chocolatey.org/install
-"@
+        Fail ("No package manager (winget / scoop / choco) was found and Scoop install failed.`n" +
+              "Install one of these manually, then re-run:`n" +
+              "  * winget  - built into Windows 10/11; update from Microsoft Store`n" +
+              "  * scoop   - https://scoop.sh`n" +
+              "  * choco   - https://chocolatey.org/install")
     }
 }
 
@@ -199,10 +197,25 @@ function Ensure-Git {
 }
 
 function Ensure-Bun {
+    # Check winget packages path or default path
+    $wingetDir = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+    if (Test-Path $wingetDir) {
+        $bunFolders = Get-ChildItem -Path $wingetDir -Filter "Oven-sh.Bun*" -Directory -ErrorAction SilentlyContinue
+        foreach ($folder in $bunFolders) {
+            $binPath = Join-Path $folder.FullName "bun-windows-x64"
+            if (Test-Path $binPath) {
+                Add-PathOnce $binPath
+            }
+        }
+    }
+    Add-PathOnce (Join-Path $HOME ".bun\bin")
+    Add-PathOnce (Join-Path $env:USERPROFILE ".bun\bin")
+    Refresh-Path
+
     if (Have bun) { Ok "Bun $(bun --version) already installed"; return }
     Step "Installing Bun"
     try {
-        powershell -NoProfile -Command "irm bun.sh/install.ps1 | iex" 2>&1 | Out-Null
+        powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; irm bun.sh/install.ps1 | iex" 2>&1 | Out-Null
     } catch {
         Fail "Bun install failed: $_`nIf you're behind a corporate proxy, set HTTPS_PROXY first."
     }
@@ -221,7 +234,7 @@ function Ensure-Python {
     foreach ($cand in @("python3.13","python3.12","python3.11","python3.10","python","python3")) {
         if (Have $cand) {
             if (-not (Test-RealPython $cand)) {
-                Warn "$cand looks like the Microsoft Store stub — skipping"
+                Warn "$cand looks like the Microsoft Store stub - skipping"
                 continue
             }
             try {
@@ -326,7 +339,7 @@ function Write-EnvIfMissing {
         Info "  Clients send this as: Authorization: Bearer <api_key>"
     }
 
-    # PYTHON_PATH should be empty (auto-detect) — server picks the venv path per-OS at runtime
+    # PYTHON_PATH should be empty (auto-detect) - server picks the venv path per-OS at runtime
     $envContent = Get-Content ".env" -Raw
     if ($envContent -notmatch 'PYTHON_PATH=') {
         Add-Content ".env" "PYTHON_PATH="
@@ -334,7 +347,7 @@ function Write-EnvIfMissing {
     } else {
         $pyPath = ((Get-Content ".env") | Where-Object { $_ -match '^PYTHON_PATH=' }) -replace '^PYTHON_PATH=', ''
         if ($pyPath -and -not (Test-Path $pyPath)) {
-            Warn "PYTHON_PATH=$pyPath does not exist — clearing for auto-detect"
+            Warn "PYTHON_PATH=$pyPath does not exist - clearing for auto-detect"
             (Get-Content ".env") -replace '^PYTHON_PATH=.*', 'PYTHON_PATH=' | Set-Content ".env"
         }
     }
@@ -385,9 +398,10 @@ function Install-NodeDeps {
 }
 
 function Setup-PythonVenv {
-    $venv = Join-Path "scripts" "auth" ".venv"
-    $venvPip = Join-Path $venv "Scripts" "pip.exe"
-    $venvPy  = Join-Path $venv "Scripts" "python.exe"
+    $ErrorActionPreference = "Continue"
+    $venv = Join-Path "scripts\auth" ".venv"
+    $venvPip = Join-Path $venv "Scripts\pip.exe"
+    $venvPy  = Join-Path $venv "Scripts\python.exe"
 
     Step "Setting up Python venv at $venv"
 
@@ -410,19 +424,19 @@ function Setup-PythonVenv {
     & $venvPip install --upgrade pip wheel 2>&1 | Out-Null
 
     Info "Installing Python packages (this may take a minute)..."
-    Retry-Action -Action { & $venvPip install -r (Join-Path "scripts" "auth" "requirements.txt") }
+    Retry-Action -Action { & $venvPip install -r (Join-Path "scripts\auth" "requirements.txt") }
     if ($LASTEXITCODE -ne 0) {
         Fail "pip install failed. Try manually: $venvPip install -r scripts\auth\requirements.txt"
     }
     Ok "Python deps installed"
 
     if ($env:ETTEUM_SKIP_BROWSERS -eq "1") {
-        Warn "ETTEUM_SKIP_BROWSERS=1 — skipping Playwright/Camoufox download."
+        Warn "ETTEUM_SKIP_BROWSERS=1 - skipping Playwright/Camoufox download."
         Warn "  Auth bot will fail until you run: $venvPy -m playwright install chromium && $venvPy -m camoufox fetch"
         return
     }
 
-    Step "Installing browsers (Playwright + Camoufox — this can take a few minutes)"
+    Step "Installing browsers (Playwright + Camoufox - this can take a few minutes)"
     Info "Installing Playwright Chromium..."
     try {
         Retry-Action -Action { & $venvPy -m playwright install chromium }
@@ -475,7 +489,7 @@ function Run-Migrations {
 
 function Install-CliShims {
     if ($env:ETTEUM_NO_CLI -eq "1") {
-        Warn "ETTEUM_NO_CLI=1 — skipping CLI install"
+        Warn "ETTEUM_NO_CLI=1 - skipping CLI install"
         return
     }
     Step "Installing CLI commands"
@@ -515,7 +529,7 @@ function Run-Preflight {
         bun scripts/preflight.ts
         if ($LASTEXITCODE -eq 0) { return }
     } catch {}
-    Warn "Preflight reported issues — see above. The server may still start."
+    Warn "Preflight reported issues - see above. The server may still start."
     Info "Run `etteum doctor` for a detailed report."
 }
 
@@ -542,7 +556,7 @@ function Main {
     Run-Preflight
 
     Write-Host ""
-    Write-Host "✓ Installation complete!" -ForegroundColor Green
+    Write-Host "[v] Installation complete!" -ForegroundColor Green
     Write-Host ""
     Write-Host "Etteum Pool is installed at: $($script:ProjectDir)"
     Write-Host ""

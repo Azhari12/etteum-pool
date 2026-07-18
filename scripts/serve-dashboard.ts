@@ -43,6 +43,11 @@ function getMimeType(path: string): string {
 Bun.serve({
   port,
   async fetch(req) {
+    // Only allow GET/HEAD requests. Non-GET/HEAD requests should not serve files to avoid Bun crash on Windows.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
     const url = new URL(req.url);
     let pathname = url.pathname;
 

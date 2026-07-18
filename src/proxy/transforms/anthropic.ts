@@ -32,6 +32,49 @@ function contentToText(content: string | AnthropicContentBlock[] | undefined): s
     .join("\n");
 }
 
+/**
+ * Normalize an OpenAI/GLM-style message/delta `content` value into a plain
+ * string. Some vision-capable upstreams (e.g. CodeBuddy China GLM) return
+ * `content` as an ARRAY of content blocks (`[{type:"text", text:"..."}]`) or
+ * as a bare OBJECT instead of a plain string. Without normalization, the
+ * converter would push that object/array straight into the Anthropic
+ * `text` field and it would serialize to `"[object Object]"`.
+ *
+ * This guarantees the Anthropic `text` block always holds a real string.
+ *
+ * Handles:
+ *  - string                  → returned as-is
+ *  - array of blocks         → join `block.text` from text blocks (nested-safe)
+ *  - object {text|content}   → recurse on the inner value
+ *  - anything else           → ""
+ */
+function contentToPlainText(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block: any) => {
+        if (block == null) return "";
+        if (typeof block === "string") return block;
+        if (typeof block.text === "string") return block.text;
+        if (typeof block.content === "string") return block.content;
+        // Nested array/object — recurse defensively.
+        if (typeof block === "object") return contentToPlainText(block);
+        return "";
+      })
+      .filter(Boolean)
+      .join("");
+  }
+  if (typeof content === "object") {
+    const obj = content as any;
+    if (typeof obj.text === "string") return obj.text;
+    if (typeof obj.content === "string") return obj.content;
+    if (obj.content != null) return contentToPlainText(obj.content);
+    return "";
+  }
+  return "";
+}
+
 function anthropicContentToOpenAI(content: string | AnthropicContentBlock[] | undefined): string | any[] {
   if (!Array.isArray(content)) return content || "";
   return content.map((block) => {
@@ -138,8 +181,8 @@ export function anthropicToOpenAI(body: AnthropicMessagesRequest): ChatCompletio
 
 export function openAIToAnthropic(response: any, request: AnthropicMessagesRequest) {
   const choice = response?.choices?.[0];
-  const text = choice?.message?.content || "";
-  const reasoning = choice?.message?.reasoning_content || "";
+  const text = contentToPlainText(choice?.message?.content) || "";
+  const reasoning = contentToPlainText(choice?.message?.reasoning_content) || "";
   const toolCalls = choice?.message?.tool_calls || [];
   const content = [];
   if (reasoning) {
@@ -321,8 +364,8 @@ export function openAIStreamToAnthropic(stream: ReadableStream<Uint8Array>, requ
               }
               const finishReason = chunk?.choices?.[0]?.finish_reason;
               const delta = chunk?.choices?.[0]?.delta || {};
-              const reasoning = delta.reasoning_content || "";
-              const text = delta.content || "";
+              const reasoning = contentToPlainText(delta.reasoning_content) || "";
+              const text = contentToPlainText(delta.content) || "";
 
               // Capture upstream usage from final chunk
               if (chunk?.usage) {

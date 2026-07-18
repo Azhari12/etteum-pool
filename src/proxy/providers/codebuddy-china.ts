@@ -64,6 +64,41 @@ export class CodeBuddyChinaProvider extends BaseProvider {
 
   private baseUrl = "https://www.codebuddy.cn";
 
+  /**
+   * Normalize an upstream `content` / `delta.content` value into a plain string.
+   *
+   * GLM vision models sometimes stream/return `content` as an ARRAY of content
+   * blocks (`[{type:"text", text:"..."}]`) or a bare OBJECT instead of a string.
+   * Concatenating such a value with `+=` would coerce it via `String()` and
+   * produce `"[object Object]"` in the final response. This guarantees a real
+   * string for both the non-stream aggregator and the streaming passthrough.
+   */
+  private normalizeContent(content: unknown): string {
+    if (content == null) return "";
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((block: any) => {
+          if (block == null) return "";
+          if (typeof block === "string") return block;
+          if (typeof block.text === "string") return block.text;
+          if (typeof block.content === "string") return block.content;
+          if (typeof block === "object") return this.normalizeContent(block);
+          return "";
+        })
+        .filter(Boolean)
+        .join("");
+    }
+    if (typeof content === "object") {
+      const obj = content as any;
+      if (typeof obj.text === "string") return obj.text;
+      if (typeof obj.content === "string") return obj.content;
+      if (obj.content != null) return this.normalizeContent(obj.content);
+      return "";
+    }
+    return "";
+  }
+
   supportedModels: ModelInfo[] = [
     // Claude
     { id: "cbc-haiku-4.5", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 200000, max_output: 8192, thinking: false, vision: false, creditUnit: "credit", creditRate: 0.11, creditSource: "upstream" },
@@ -769,7 +804,8 @@ export class CodeBuddyChinaProvider extends BaseProvider {
           const choice = chunk.choices?.[0];
           const delta = choice?.delta || {};
 
-          if (delta.content) content += delta.content;
+          const deltaText = this.normalizeContent(delta.content);
+          if (deltaText) content += deltaText;
 
           if (choice?.finish_reason) finishReason = choice.finish_reason || "stop";
 
@@ -808,6 +844,9 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     const encoder = new TextEncoder();
     let capturedUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     let capturedRealCredit: number | null = null;
+    // Capture provider reference for use inside the ReadableStream source
+    // callback (whose own `this` is the UnderlyingSource, not the provider).
+    const self = this;
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -838,7 +877,24 @@ export class CodeBuddyChinaProvider extends BaseProvider {
               try {
                 const parsed = JSON.parse(data);
                 const choice = parsed.choices?.[0];
-                const delta = choice?.delta || {};
+
+                // Normalize vision content to a plain string. GLM vision models
+                // may emit `delta.content` as an array of blocks or an object;
+                // passing it through verbatim would surface as `[object Object]`
+                // downstream once it is coerced to a string. Keep other delta
+                // fields (tool_calls, reasoning_content, finish_reason) intact.
+                const rawDelta = choice?.delta || {};
+                const delta: any = { ...rawDelta };
+                if (delta.content != null) {
+                  const normalized = self.normalizeContent(delta.content);
+                  if (normalized) delta.content = normalized;
+                  else delete delta.content;
+                }
+                if (delta.reasoning_content != null) {
+                  const normalized = self.normalizeContent(delta.reasoning_content);
+                  if (normalized) delta.reasoning_content = normalized;
+                  else delete delta.reasoning_content;
+                }
 
                 const chunk: StreamChunk = {
                   id: parsed.id || id,
