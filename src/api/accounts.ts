@@ -3,6 +3,8 @@ import { db } from "../db/index";
 import { accounts, requestLogs, vccCards, vccTransactions, settings } from "../db/schema";
 import { eq, inArray } from "drizzle-orm";
 import { encrypt, decrypt } from "../utils/crypto";
+import { decodeJwtExp, looksLikeJwt } from "../utils/jwt";
+import type { ChatCompletionRequest } from "../proxy/providers/base";
 import { broadcast } from "../ws/index";
 import type { NewAccount } from "../db/schema";
 import { loginQueue } from "../auth/queue";
@@ -149,11 +151,13 @@ accountsRouter.get("/warmup-queue", (c) => {
 accountsRouter.get("/", async (c) => {
   const allAccounts = await db.select().from(accounts);
 
-  // Don't expose passwords in response
+  // Don't expose passwords in response. Flag whether this account exposes an
+  // API key (only BYOK accounts do — non-BYOK use email/password via auth bot).
   const sanitized = allAccounts.map((acc) => ({
     ...acc,
     password: "***",
     tokens: acc.tokens ? "[set]" : null,
+    hasApiKey: acc.provider === "byok" || acc.provider === "codebuddy-china",
   }));
 
   return c.json({ data: sanitized, total: sanitized.length });
@@ -1160,6 +1164,191 @@ accountsRouter.post("/gitlab-duo/:id/refresh", async (c) => {
 });
 
 /**
+ * GET /api/accounts/:id/models - List models available for an account's provider.
+ * Used by the Test dialog to populate the model dropdown.
+ */
+accountsRouter.get("/:id/models", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return c.json({ error: "Invalid account id" }, 400);
+  const account = await db.select().from(accounts).where(eq(accounts.id, id)).get();
+  if (!account) return c.json({ error: "Account not found" }, 404);
+
+  const { providers } = await import("../proxy/providers/registry");
+  const providerName = account.provider as keyof typeof providers;
+  const provider = providers[providerName];
+  if (!provider) return c.json({ error: `Unknown provider: ${account.provider}` }, 400);
+
+  const models = provider.getModels().map((m) => ({
+    id: m.id,
+    vision: (m as any).vision ?? false,
+    thinking: (m as any).thinking ?? false,
+    creditRate: (m as any).creditRate,
+  }));
+  return c.json({ models, default: models[0]?.id });
+});
+
+/**
+ * POST /api/accounts/:id/test - Test an account with a minimal prompt.
+ *
+ * Sends a tiny chat completion (prompt "hallo", max_tokens:1) directly to the
+ * account's upstream provider via its chatCompletion() method, bypassing the
+ * router/pool. If the response succeeds, the account status is flipped to
+ * "active" (reactivating exhausted/error accounts whose credentials still work).
+ *
+ * Model selection: the provider's first supported model. For codebuddy-china
+ * that is cbc-haiku-4.5 (cheapest creditRate) to minimize credit consumption.
+ */
+accountsRouter.post("/:id/test", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return c.json({ error: "Invalid account id" }, 400);
+  const reqBody = await c.req.json().catch(() => ({})) as { model?: string };
+
+  const account = await db.select().from(accounts).where(eq(accounts.id, id)).get();
+  if (!account) return c.json({ error: "Account not found" }, 404);
+
+  const { providers } = await import("../proxy/providers/registry");
+  const providerName = account.provider as keyof typeof providers;
+  const provider = providers[providerName];
+  if (!provider) {
+    return c.json({ success: false, error: `Unknown provider: ${account.provider}` }, 400);
+  }
+
+  const models = provider.getModels();
+  if (!models || models.length === 0) {
+    return c.json({ success: false, error: "Provider has no supported models" }, 400);
+  }
+  // Caller may pass a specific model id; validate it belongs to this provider.
+  // Default to the first supported model (for codebuddy-china: cbc-haiku-4.5, cheapest).
+  let testModel: string;
+  if (reqBody.model) {
+    const found = models.find((m) => m.id === reqBody.model);
+    if (!found) {
+      return c.json({ success: false, error: `Model "${reqBody.model}" not available for provider ${account.provider}` }, 400);
+    }
+    testModel = found.id;
+  } else {
+    testModel = models[0]!.id;
+  }
+
+  const testRequest = {
+    model: testModel,
+    messages: [{ role: "user" as const, content: "hallo" }],
+    max_tokens: 1,
+    stream: false,
+  } as ChatCompletionRequest;
+
+  const startTime = Date.now();
+  try {
+    const result = await provider.chatCompletion(account, testRequest);
+    const latencyMs = Date.now() - startTime;
+
+    if (result.success) {
+      // Credentials work — flip to active (covers exhausted/error → active).
+      const reactivated = account.status !== "active";
+      if (reactivated) {
+        await db.update(accounts).set({
+          status: "active",
+          errorMessage: null,
+          updatedAt: new Date(),
+        }).where(eq(accounts.id, id));
+        pool.invalidate(providerName);
+        broadcast({
+          type: "account_status",
+          data: { id, status: "active", provider: account.provider, tested: true },
+        });
+      }
+      return c.json({
+        success: true,
+        message: "Test passed — account is active",
+        model: testModel,
+        latency_ms: latencyMs,
+        credits_used: result.creditsUsed ?? 0,
+        reactivated,
+      });
+    }
+
+    // Test failed — surface why. For an already-exhausted account, a quota/
+    // 429/exhausted upstream error means the account is still genuinely out of
+    // credits upstream (not a proxy bug). Make that distinction explicit so the
+    // UI can tell the user it's not a transient/config issue.
+    const rawErr = result.error || "Test failed";
+    const stillExhausted = result.quotaExhausted === true
+      || /quota|exhaust|429|insufficient.*credit|余额不足|额度|credit/i.test(rawErr);
+    return c.json({
+      success: false,
+      error: stillExhausted && account.status === "exhausted"
+        ? `Still exhausted upstream — ${rawErr}`
+        : rawErr,
+      latency_ms: latencyMs,
+      quota_exhausted: result.quotaExhausted === true,
+      still_exhausted: stillExhausted && account.status === "exhausted",
+      previous_status: account.status,
+    });
+  } catch (error) {
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : "Test error",
+      latency_ms: Date.now() - startTime,
+    });
+  }
+});
+
+/**
+ * POST /api/accounts/:id/reveal - Reveal the API key secret for an account.
+ *
+ * Only BYOK accounts store an API key (in the encrypted `password` column).
+ * Non-BYOK accounts use email/password via the auth bot; their password is
+ * never revealed here — a clear error is returned instead. The list endpoint
+ * keeps secrets masked; this is called only on an explicit eye-icon action
+ * from the authenticated dashboard.
+ */
+accountsRouter.post("/:id/reveal", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return c.json({ error: "Invalid account id" }, 400);
+
+  const account = await db.select().from(accounts).where(eq(accounts.id, id)).get();
+  if (!account) {
+    return c.json({ error: "Account not found" }, 404);
+  }
+
+  // BYOK and CodeBuddy China store their credential (api key ck_... or JWT
+  // access_token) in the encrypted `password` column. Other providers use
+  // email/password via the auth bot — their password is never revealed here.
+  if (account.provider !== "byok" && account.provider !== "codebuddy-china") {
+    return c.json({
+      success: false,
+      error: "This account type does not expose a key/token (uses email+password auth)",
+      source: account.provider,
+    });
+  }
+
+  try {
+    const key = decrypt(account.password);
+    // For CBC, also surface auth_method + exp (from tokens) so the UI can label
+    // whether this is a static ck_ key or a JWT access_token.
+    let auth_method: string | undefined;
+    let exp: number | undefined;
+    if (account.provider === "codebuddy-china" && account.tokens) {
+      try {
+        const t = typeof account.tokens === "string" ? JSON.parse(account.tokens) : account.tokens;
+        auth_method = t?.auth_method;
+        exp = t?.exp;
+      } catch { /* ignore */ }
+    }
+    return c.json({
+      success: true,
+      id: account.id,
+      key,
+      source: account.provider,
+      auth_method,
+      exp,
+    });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to decrypt key" }, 500);
+  }
+});
+
+/**
  * GET /api/accounts/:id - Get single account
  */
 accountsRouter.get("/:id", async (c) => {
@@ -1191,6 +1380,7 @@ accountsRouter.post("/", async (c) => {
     personalToken?: string;
     apiKey?: string; // YouMind sk-ym-... key
     apiKeys?: string; // CodeBuddy China bulk: newline-separated ck_... keys
+    jwtResponse?: string; // CodeBuddy China: full JSON login response (access_token + refresh_token + ...)
     tokens?: Record<string, unknown>;
     status?: "active" | "pending";
     browserEngine?: string;
@@ -1357,6 +1547,70 @@ accountsRouter.post("/", async (c) => {
       count: created.length,
       accounts: created,
     }, 201);
+  }
+
+  // ── CodeBuddy China: JWT login-response flow ────────────────────────
+  // Accept the full JSON response from a codebuddy.cn login (access_token JWT
+  // + refresh_token + uid + credits + identity). Store access_token as the
+  // bearer credential; refresh_token + exp are read by the provider's
+  // refreshToken() and validateApiKey() fast-path.
+  //
+  // Unlike ck_ API keys, JWT accounts do NOT participate in the per-request
+  // quota tracker (decrementQuota) — the frontend/backend marks them so the
+  // remaining-credit stays a snapshot from login until the next warmup syncs
+  // it from the billing endpoint.
+  if (body.provider === "codebuddy-china" && body.jwtResponse) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(body.jwtResponse);
+    } catch {
+      return c.json({ error: "jwtResponse is not valid JSON" }, 400);
+    }
+
+    const accessToken = parsed?.access_token;
+    if (!accessToken || typeof accessToken !== "string" || !looksLikeJwt(accessToken)) {
+      return c.json({ error: "jwtResponse missing a valid access_token (expected a JWT starting with eyJ)" }, 400);
+    }
+
+    const exp = decodeJwtExp(accessToken);
+    const refresh = typeof parsed.refresh_token === "string" ? parsed.refresh_token : null;
+    const uid = typeof parsed.uid === "string" ? parsed.uid : null;
+    const credits = typeof parsed.credits === "number" ? parsed.credits : null;
+
+    // Email label: prefer identity.username, then uid, else generated.
+    const existingCount = await db.select().from(accounts)
+      .where(eq(accounts.provider, "codebuddy-china"))
+      .then((rows) => rows.length);
+    const email = parsed?.identity?.username || uid || `cbc-jwt-${existingCount + 1}`;
+    const encrypted = encrypt(accessToken);
+
+    const tokens = {
+      api_key: null,
+      access_token: accessToken,
+      refresh_token: refresh,
+      uid,
+      credits,
+      identity: parsed?.identity ?? null,
+      exp,
+      auth_method: "jwt" as const,
+    };
+
+    const inserted = await db.insert(accounts).values({
+      provider: "codebuddy-china",
+      email,
+      password: encrypted,
+      status: "active",
+      tokens,
+      // Snapshot from login; warmup syncs real-time remaining from get-user-resource.
+      quotaLimit: credits ?? -1,
+      quotaRemaining: credits ?? -1,
+      lastLoginAt: new Date(),
+    }).returning();
+
+    pool.invalidate("codebuddy-china" as any);
+    broadcast({ type: "account_created", data: { provider: "codebuddy-china", id: inserted[0]?.id } });
+
+    return c.json({ success: true, id: inserted[0]?.id, email, exp }, 201);
   }
 
   if (!body.email || !body.password) {

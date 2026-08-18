@@ -1,6 +1,6 @@
 import { db } from "../db/index";
 import { accounts, settings } from "../db/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, lt } from "drizzle-orm";
 import type { Account } from "../db/schema";
 import { broadcast } from "../ws/index";
 import { config } from "../config";
@@ -25,6 +25,11 @@ class AccountPool {
 
   private activeAccountsCache = new Map<ProviderName, ActiveAccountsCacheEntry>();
   private inFlightByAccountId = new Map<number, number>();
+  // Exhausted-account one-shot retry tracking. Maps provider → set of account ids
+  // already tried in the current refresh cycle. Reset whenever the active-accounts
+  // cache is invalidated (refresh/restart). Prevents repeatedly hammering an
+  // exhausted account within the same cycle.
+  private exhaustedTriedByProvider = new Map<ProviderName, Set<number>>();
   private lbMethodCache: {
     global: string;
     perProvider: Map<ProviderName, string>;
@@ -38,10 +43,12 @@ class AccountPool {
   invalidate(provider?: ProviderName): void {
     if (provider) {
       this.activeAccountsCache.delete(provider);
+      this.exhaustedTriedByProvider.delete(provider);
       return;
     }
 
     this.activeAccountsCache.clear();
+    this.exhaustedTriedByProvider.clear();
   }
 
   async getLoadBalancingMethod(provider: ProviderName): Promise<string> {
@@ -384,6 +391,81 @@ class AccountPool {
         updatedAt: new Date(),
       })
       .where(eq(accounts.id, accountId));
+  }
+
+  /**
+   * Find an exhausted account to try as a fallback when no active account is
+   * available. One-shot per refresh cycle: accounts already tried in this cycle
+   * (tracked in `exhaustedTriedByProvider`) are skipped.
+   *
+   * Respects the 24h server-side rate-limit grace period: accounts exhausted
+   * within the last 24 hours are NOT returned, to avoid hammering upstream.
+   */
+  async getExhaustedFallbackAccount(provider: ProviderName): Promise<Account | null> {
+    const tried = this.exhaustedTriedByProvider.get(provider) || new Set<number>();
+    if (tried.size === 0) {
+      // No exhausted account tried yet in this cycle — nothing to exclude.
+    }
+    const graceCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const rows = await db
+      .select()
+      .from(accounts)
+      .where(
+        and(
+          eq(accounts.provider, provider),
+          eq(accounts.status, "exhausted"),
+          eq(accounts.enabled, true),
+          lt(accounts.updatedAt, graceCutoff),
+        )
+      );
+
+    // Prefer accounts not yet tried in this cycle; pick the oldest-updated for
+    // deterministic order (longest since last attempt).
+    const candidate = rows
+      .filter((r) => !tried.has(r.id))
+      .sort((a, b) => {
+        const ta = a.updatedAt ? a.updatedAt.getTime() : 0;
+        const tb = b.updatedAt ? b.updatedAt.getTime() : 0;
+        return ta - tb;
+      })[0];
+
+    return candidate || null;
+  }
+
+  /**
+   * Mark an exhausted account as "tried" in the current refresh cycle so it is
+   * not picked again until the next invalidate/refresh.
+   */
+  markExhaustedTried(provider: ProviderName, accountId: number): void {
+    const tried = this.exhaustedTriedByProvider.get(provider) || new Set<number>();
+    tried.add(accountId);
+    this.exhaustedTriedByProvider.set(provider, tried);
+  }
+
+  /**
+   * Reactivate an account from `exhausted` → `active` based on an ACTUAL
+   * successful request (NOT the quota tracker). Called from the router when a
+   * request served by an exhausted-account fallback succeeds.
+   */
+  async markActiveFromExhausted(accountId: number): Promise<void> {
+    const [account] = await db
+      .update(accounts)
+      .set({
+        status: "active",
+        errorMessage: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(accounts.id, accountId))
+      .returning();
+
+    if (account) {
+      this.invalidate(account.provider as ProviderName);
+      broadcast({
+        type: "account_status",
+        data: { id: accountId, status: "active", provider: account.provider, reactivated: true },
+      });
+    }
   }
 
   /**

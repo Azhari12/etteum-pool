@@ -252,6 +252,7 @@ function wrapStreamWithUsageFinalizer(
     fallbackCreditsUsed: number;
     fallbackCreditSource: CreditSource;
     useFreeCounter: boolean;
+    skipQuotaTracker?: boolean;
   }
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
@@ -366,7 +367,7 @@ function wrapStreamWithUsageFinalizer(
         let quotaAfter = context.quotaBefore;
         if (isQoder && context.useFreeCounter && context.quotaBefore > 0) {
           quotaAfter = await pool.decrementFreeQuota(context.accountId, 1);
-        } else if (!isQoder && context.quotaBefore > 0) {
+        } else if (!isQoder && context.quotaBefore > 0 && !context.skipQuotaTracker) {
           quotaAfter = await pool.decrementQuota(context.accountId, creditsUsed);
         }
 
@@ -493,6 +494,18 @@ async function handleChatCompletion(body: ChatCompletionRequest) {
     const qoderProvider = providers["qoder"] as { isFreeModel?: (m: string) => boolean } | undefined;
     const useFreeCounter = isQoder && qoderProvider?.isFreeModel?.(body.model) === true;
 
+    // JWT-based CodeBuddy China accounts (login-response flow) opt out of the
+    // per-request quota tracker. Their `quotaRemaining` stays a snapshot from
+    // login until the next warmup syncs it from the billing endpoint —
+    // reactivation is driven by real request outcomes, not by the local counter.
+    let skipQuotaTracker = false;
+    if (provider === "codebuddy-china" && account.tokens) {
+      try {
+        const t = typeof account.tokens === "string" ? JSON.parse(account.tokens) : account.tokens;
+        if (t?.auth_method === "jwt") skipQuotaTracker = true;
+      } catch { /* ignore parse errors — default to tracked */ }
+    }
+
     const quotaBefore = isQoder
       ? useFreeCounter
         ? Number(account.freeRemaining ?? 0)
@@ -506,7 +519,7 @@ async function handleChatCompletion(body: ChatCompletionRequest) {
       if (isQoder && useFreeCounter && quotaBefore > 0) {
         // Qoder /activity bucket charges 1 request per call regardless of token count.
         quotaAfter = await pool.decrementFreeQuota(account.id, 1);
-      } else if (!isQoder && quotaBefore > 0) {
+      } else if (!isQoder && quotaBefore > 0 && !skipQuotaTracker) {
         quotaAfter = await pool.decrementQuota(account.id, creditsUsed);
       }
     }
@@ -559,6 +572,7 @@ async function handleChatCompletion(body: ChatCompletionRequest) {
       fallbackCreditsUsed: creditsUsed,
       fallbackCreditSource: creditSource,
       useFreeCounter,
+      skipQuotaTracker,
     });
 
       shouldReleaseTracking = false;

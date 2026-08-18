@@ -109,6 +109,8 @@ export default function Accounts() {
   const [codebuddyChinaApiKey, setCodebuddyChinaApiKey] = useState("");
   const [codebuddyChinaBulkApiKeys, setCodebuddyChinaBulkApiKeys] = useState("");
   const [codebuddyChinaBusy, setCodebuddyChinaBusy] = useState(false);
+  const [codebuddyChinaJwt, setCodebuddyChinaJwt] = useState("");
+  const [codebuddyChinaMode, setCodebuddyChinaMode] = useState<"apikey" | "jwt">("apikey");
   const [loginPendingDialog, setLoginPendingDialog] = useState(false);
   const [loginPendingConcurrency, setLoginPendingConcurrency] = useState(2);
   const [byokProviders, setByokProviders] = useState<ByokProvider[]>([]);
@@ -471,6 +473,41 @@ export default function Accounts() {
       });
       showSuccess(`Added ${res.count} CodeBuddy CN account(s) successfully`);
       setCodebuddyChinaBulkApiKeys("");
+      setAddDialogProvider(null);
+      await load();
+    } catch (err) { showError(err); }
+    finally { setCodebuddyChinaBusy(false); }
+  }
+
+  async function handleCodebuddyChinaJwtLogin() {
+    const raw = codebuddyChinaJwt.trim();
+    if (!raw) { showError(new Error("Paste the full login JSON response OR just the JWT access_token (eyJ...)")); return; }
+
+    // Accept either:
+    //  (a) a bare JWT access_token (eyJ...) — wrap into a minimal object
+    //  (b) the full login response JSON (with access_token + refresh_token + ...)
+    let payload: string;
+    if (raw.startsWith("eyJ") && raw.split(".").length === 3) {
+      payload = JSON.stringify({ access_token: raw });
+    } else {
+      let parsed: any;
+      try { parsed = JSON.parse(raw); }
+      catch { showError(new Error("Input is not a JWT nor valid JSON — paste a JWT (eyJ...) or the full response object")); return; }
+      if (!parsed?.access_token || typeof parsed.access_token !== "string" || !parsed.access_token.startsWith("eyJ")) {
+        showError(new Error("Response missing access_token (expected a JWT starting with eyJ)"));
+        return;
+      }
+      payload = JSON.stringify(parsed);
+    }
+
+    setCodebuddyChinaBusy(true);
+    try {
+      const res = await fetchApi<any>("/api/accounts", {
+        method: "POST",
+        body: JSON.stringify({ provider: "codebuddy-china", jwtResponse: payload }),
+      });
+      showSuccess(`CodeBuddy CN JWT account added: ${res?.email || "account"}${res?.exp ? ` (token exp ${new Date(res.exp * 1000).toLocaleString()})` : ""}`);
+      setCodebuddyChinaJwt("");
       setAddDialogProvider(null);
       await load();
     } catch (err) { showError(err); }
@@ -1520,9 +1557,12 @@ export default function Accounts() {
             </div>
           ) : addDialogProvider === "codebuddy-china" ? (
             <div className="flex gap-1 rounded-md bg-[var(--secondary)] p-1">
-              <button onClick={() => setAddMode("apikey")}
-                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "apikey" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              <button onClick={() => setCodebuddyChinaMode("apikey")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${codebuddyChinaMode === "apikey" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
               >Bulk API Key (ck_...)</button>
+              <button onClick={() => setCodebuddyChinaMode("jwt")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${codebuddyChinaMode === "jwt" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              >Login Response (JWT)</button>
             </div>
           ) : (
             <div className="flex gap-1 rounded-md bg-[var(--secondary)] p-1">
@@ -1636,7 +1676,7 @@ export default function Accounts() {
             </div>
           )}
 
-          {addMode === "apikey" && addDialogProvider === "codebuddy-china" && (
+          {codebuddyChinaMode === "apikey" && addDialogProvider === "codebuddy-china" && (
             <div className="space-y-4">
               <div>
                 <label className="text-sm text-[var(--foreground)]">API Keys (satu per baris, prefix ck_)</label>
@@ -1658,6 +1698,33 @@ ck_xyz789ghi012..."
                 <Button variant="outline" onClick={() => setAddDialogProvider(null)} disabled={codebuddyChinaBusy}>Cancel</Button>
                 <Button onClick={handleCodeBuddyChinaBulkApiKey} disabled={codebuddyChinaBusy || !codebuddyChinaBulkApiKeys.trim()}>
                   {codebuddyChinaBusy ? (<><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Importing...</>) : "Add Accounts"}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {codebuddyChinaMode === "jwt" && addDialogProvider === "codebuddy-china" && (
+            <div className="space-y-4">
+              <div>
+                <label className="text-sm text-[var(--foreground)]">Login Response (full JSON)</label>
+                <textarea
+                  value={codebuddyChinaJwt}
+                  onChange={(e) => setCodebuddyChinaJwt(e.target.value)}
+                  className="mt-1 w-full h-48 rounded-md border border-[var(--border)] bg-[var(--background)] p-3 text-sm font-mono text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--ring)] resize-none"
+                  placeholder={'Full login response:\n{\n  "access_token": "eyJhbGciOi...",\n  "refresh_token": "eyJhbGciOi...",\n  "uid": "...",\n  "credits": 2100\n}\n\n— atau cukup JWT access_token saja:\neyJhbGciOiJSUzI1NiIs...'}
+                  disabled={codebuddyChinaBusy}
+                />
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                  Paste <strong>full response login</strong> dari <code>codebuddy.cn</code> <em>atau cukup JWT access_token saja</em> (<code>eyJ...</code>).
+                  Wajib berisi <code>access_token</code>. <code>refresh_token</code> (jika ada) dipakai untuk perpanjang session otomatis saat token expired.
+                  Credits (mis. <code>2100</code>) disimpan sebagai info quota awal; warmup sync real-time via endpoint billing.
+                  Akun JWT <strong>tidak ikut quota tracker per-request</strong>.
+                </p>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setAddDialogProvider(null)} disabled={codebuddyChinaBusy}>Cancel</Button>
+                <Button onClick={handleCodebuddyChinaJwtLogin} disabled={codebuddyChinaBusy || !codebuddyChinaJwt.trim()}>
+                  {codebuddyChinaBusy ? (<><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Adding...</>) : "Add Account"}
                 </Button>
               </div>
             </div>

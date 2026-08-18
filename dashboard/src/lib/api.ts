@@ -834,6 +834,46 @@ export async function revealByokKey(
   return fetchApi(`/api/accounts/byok/${id}/reveal`, { method: "POST" });
 }
 
+// List the models available for an account's provider (for the Test dialog).
+export async function fetchAccountModels(id: number): Promise<{
+  models: Array<{ id: string; vision?: boolean; thinking?: boolean; creditRate?: number }>;
+  default?: string;
+}> {
+  return fetchApi(`/api/accounts/${id}/models`);
+}
+
+// Test an account with a minimal "hallo" prompt. On success the backend flips
+// the account to active (reactivating exhausted/error accounts). Returns
+// latency + credits_used so the UI can show what the probe cost.
+export async function testAccount(
+  id: number,
+  model?: string
+): Promise<{
+  success: boolean;
+  message?: string;
+  model?: string;
+  latency_ms?: number;
+  credits_used?: number;
+  reactivated?: boolean;
+  error?: string;
+  quota_exhausted?: boolean;
+  still_exhausted?: boolean;
+  previous_status?: string;
+}> {
+  return fetchApi(`/api/accounts/${id}/test`, {
+    method: "POST",
+    body: model ? JSON.stringify({ model }) : undefined,
+  });
+}
+
+// Reveal the API key for ANY account (generic endpoint). Only BYOK accounts
+// store a key; non-BYOK accounts return success:false with an explanatory error.
+export async function revealAccountKey(
+  id: number
+): Promise<{ success: boolean; id?: number; key?: string; error?: string; source?: string }> {
+  return fetchApi(`/api/accounts/${id}/reveal`, { method: "POST" });
+}
+
 export async function testByokProvider(
   id: number,
   model?: string

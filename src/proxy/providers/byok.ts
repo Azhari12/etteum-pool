@@ -272,6 +272,16 @@ export class ByokProvider extends BaseProvider {
       );
     }
 
+    // Last-resort tier: exhausted accounts. One-shot per refresh cycle — the
+    // pool's exhaustedTriedByProvider set (keyed "byok") prevents retrying the
+    // same exhausted key within the same cycle. The caller (router) will
+    // flip the account back to "active" if this attempt succeeds.
+    if (candidates.length === 0) {
+      candidates = entries.filter((entry) =>
+        entry.account.enabled && entry.account.status === "exhausted" && supportsModel(entry) && notExcluded(entry)
+      );
+    }
+
     if (candidates.length === 0) return null;
     return this.selectAccount(prefix, candidates, options).account;
   }

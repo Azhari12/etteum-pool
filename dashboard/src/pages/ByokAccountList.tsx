@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, Eye, EyeOff, FlaskConical, Key, Plus, RefreshCw, Save, Trash2, Zap } from "lucide-react";
+import { ArrowLeft, Eye, EyeOff, FlaskConical, Key, Plus, RefreshCw, Save, Trash2, Zap, Copy, Check } from "lucide-react";
 import {
   deleteAccount,
   fetchByokProviders,
@@ -56,6 +56,7 @@ export default function ByokAccountList() {
   const [saving, setSaving] = useState(false);
   const [testingKey, setTestingKey] = useState<number | null>(null);
   const [revealingKey, setRevealingKey] = useState<string | null>(null);
+  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
   const [visibleSecrets, setVisibleSecrets] = useState<Set<string>>(new Set());
   const { message, setMessage, clearMessage } = useTimedMessage<string>(null, 4000);
   const [error, setError] = useState<string | null>(null);
@@ -375,6 +376,24 @@ export default function ByokAccountList() {
                           title={secretVisible ? "Hide key" : "Show key"}
                         >
                           {revealingKey === visibilityId ? <RefreshCw className="h-4 w-4 animate-spin" /> : secretVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 shrink-0"
+                          title="Copy key"
+                          disabled={!secretVisible || !key.key || key.key === MASK}
+                          onClick={async () => {
+                            if (!key.key || key.key === MASK) return;
+                            try {
+                              await navigator.clipboard.writeText(key.key);
+                              setCopiedKeyId(visibilityId);
+                              setTimeout(() => setCopiedKeyId((cur) => cur === visibilityId ? null : cur), 1500);
+                            } catch { /* ignore */ }
+                          }}
+                        >
+                          {copiedKeyId === visibilityId ? <Check className="h-4 w-4 text-[var(--success)]" /> : <Copy className="h-4 w-4" />}
                         </Button>
                       </div>
                     </td>

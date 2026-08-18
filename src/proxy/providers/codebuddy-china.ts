@@ -9,11 +9,18 @@ import {
 } from "./base";
 import type { Account } from "../../db/schema";
 import { config } from "../../config";
+import { decodeJwtExp } from "../../utils/jwt";
 
 interface CodeBuddyChinaTokens {
   api_key?: string;
   access_token?: string;
   session_token?: string;
+  refresh_token?: string;     // JWT offline_access refresh token
+  uid?: string;
+  credits?: number;
+  identity?: any;
+  exp?: number;              // JWT access_token expiry (unix seconds)
+  auth_method?: "jwt" | "api_key";
 }
 
 /** Map cbc- prefixed model IDs to actual CodeBuddy China API model names. */
@@ -33,6 +40,7 @@ const CBC_MODEL_MAP: Record<string, string> = {
   // GLM (Zhipu)
   "cbc-glm-5.1": "glm-5.1",
   "cbc-glm-5.2": "glm-5.2",
+  "cbc-glm-5.3": "glm-5.3",
   "cbc-glm-5v-turbo": "glm-5v-turbo",
   // MiniMax
   "cbc-minimax-m3": "minimax-m3",
@@ -115,6 +123,7 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     // GLM — 5.1 / 5.2 / 5v-turbo all support vision (5v-turbo is the dedicated vision model)
     { id: "cbc-glm-5.1", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 200000, max_output: 8192, thinking: false, vision: true, creditUnit: "credit", creditRate: 0.02, creditSource: "upstream" },
     { id: "cbc-glm-5.2", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 1000000, max_output: 8192, thinking: false, vision: true, creditUnit: "credit", creditRate: 0.02, creditSource: "upstream" },
+    { id: "cbc-glm-5.3", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 1000000, max_output: 8192, thinking: false, vision: true, creditUnit: "credit", creditRate: 0.02, creditSource: "upstream" },
     { id: "cbc-glm-5v-turbo", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 200000, max_output: 8192, thinking: false, vision: true, creditUnit: "credit", creditRate: 0.03, creditSource: "upstream" },
     // MiniMax — vision support is flaky upstream (model often replies "I don't see"), kept enabled for parity
     { id: "cbc-minimax-m3", object: "model", created: Date.now(), owned_by: "codebuddy-china", context_window: 512000, max_output: 8192, thinking: false, vision: true, creditUnit: "credit", creditRate: 0.10, creditSource: "upstream" },
@@ -505,9 +514,53 @@ export class CodeBuddyChinaProvider extends BaseProvider {
   }
 
   async refreshToken(
-    _account: Account
+    account: Account
   ): Promise<{ success: boolean; tokens?: string; error?: string }> {
-    return { success: false, error: "CodeBuddy China uses static API keys — no refresh" };
+    const tokens = this.getTokens(account);
+    // Only JWT-based accounts (login-response flow) carry a refresh_token and
+    // can renew their access_token via the Keycloak OIDC token endpoint.
+    // Static ck_ API keys never expire by refresh and must be re-issued.
+    if (!tokens || tokens.auth_method !== "jwt" || !tokens.refresh_token) {
+      return { success: false, error: "CodeBuddy China: static API key or no refresh_token — no refresh" };
+    }
+
+    try {
+      const res = await fetch(
+        "https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/token",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: tokens.refresh_token,
+            client_id: "console", // matches the `azp` claim in issued tokens
+          }),
+        }
+      );
+
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        return { success: false, error: `Refresh failed: ${res.status} ${detail}` };
+      }
+
+      const data = await res.json() as any;
+      const newAccess = data.access_token;
+      if (!newAccess || typeof newAccess !== "string") {
+        return { success: false, error: "Refresh response missing access_token" };
+      }
+      const newRefresh = typeof data.refresh_token === "string" ? data.refresh_token : tokens.refresh_token;
+      const exp = decodeJwtExp(newAccess);
+
+      const newTokens: CodeBuddyChinaTokens = {
+        ...tokens,
+        access_token: newAccess,
+        refresh_token: newRefresh,
+        exp: exp ?? undefined,
+      };
+      return { success: true, tokens: JSON.stringify(newTokens) };
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : "Refresh error" };
+    }
   }
 
   async validateAccount(account: Account): Promise<boolean> {
@@ -619,6 +672,12 @@ export class CodeBuddyChinaProvider extends BaseProvider {
   private async validateApiKey(tokens: CodeBuddyChinaTokens): Promise<"ok" | "quota_exhausted" | "expired"> {
     const apiKey = this.getApiKey(tokens);
     if (!apiKey) return "expired";
+
+    // Fast-path: a JWT access_token whose exp has already passed is expired
+    // without an extra API round-trip. (API keys have no exp and skip this.)
+    if (tokens.auth_method === "jwt" && typeof tokens.exp === "number" && tokens.exp * 1000 < Date.now()) {
+      return "expired";
+    }
 
     // Primary: use billing API to validate — doesn't consume credits and gives definitive auth status
     try {

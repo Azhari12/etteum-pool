@@ -4,7 +4,9 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, Search, Trash2, RefreshCw, RotateCcw, ExternalLink, ArrowUpDown, ArrowUp, ArrowDown, CheckCircle2, XCircle } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle } from "@/components/ui/dialog";
+import { Select } from "@/components/ui/select";
+import { ArrowLeft, Search, Trash2, RefreshCw, RotateCcw, ExternalLink, ArrowUpDown, ArrowUp, ArrowDown, CheckCircle2, XCircle, Key, Copy, Eye, EyeOff, Check, FlaskConical, Loader2 } from "lucide-react";
 import { formatDateTimeID } from "@/lib/utils";
 import { useTimedMessage } from "@/hooks/useTimedMessage";
 import { useWsEvent } from "@/hooks/useWebSocket";
@@ -15,6 +17,9 @@ import {
   loginAccount,
   loginAccounts,
   openPanel,
+  revealAccountKey,
+  testAccount,
+  fetchAccountModels,
   toggleAccountEnabled,
   toggleAllAccounts,
   warmupAccount,
@@ -52,6 +57,7 @@ interface Account {
   lastUsedAt?: string | null;
   lastLoginAt?: string | null;
   errorMessage?: string | null;
+  hasApiKey?: boolean;
   metadata?: {
     codex_quota?: CodexQuotaMetadata;
     overage?: { enabled: boolean; capable: boolean; used: number; cap: number; remaining: number } | null;
@@ -136,6 +142,89 @@ function formatResetIn(seconds: number) {
   if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
+}
+
+/**
+ * API-key cell for BYOK accounts. Renders a small key icon next to the email;
+ * clicking it opens a lightweight popover with a masked key, an eye-toggle to
+ * reveal (via POST /api/accounts/:id/reveal), and a copy button.
+ * Non-BYOK accounts render nothing here — they don't store an API key.
+ */
+function ApiKeyCell({ account }: { account: Account }) {
+  const [open, setOpen] = useState(false);
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const [masked, setMasked] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const cellRef = useRef<HTMLSpanElement>(null);
+
+  if (!account.hasApiKey) return null;
+
+  async function handleReveal() {
+    if (revealed) { setMasked((m) => !m); return; }
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await revealAccountKey(account.id);
+      if (res.success && res.key) {
+        setRevealed(res.key);
+        setMasked(false);
+      } else {
+        setError(res.error || "No API key available");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to reveal API key");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleCopy() {
+    if (!revealed) return;
+    try {
+      await navigator.clipboard.writeText(revealed);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setError("Copy failed");
+    }
+  }
+
+  return (
+    <span ref={cellRef} className="relative inline-flex">
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-6 w-6 ml-1"
+        title="API key"
+        onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
+      >
+        <Key className="w-3.5 h-3.5 text-[var(--muted-foreground)]" />
+      </Button>
+      {open && (
+        <span
+          className="absolute z-50 top-6 left-0 min-w-[220px] bg-[var(--card)] border border-[var(--border)] rounded-md shadow-md p-2 text-xs"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="font-medium mb-1 text-[var(--foreground)]">API Key</div>
+          <div className="flex items-center gap-1">
+            <code className="flex-1 px-2 py-1 rounded bg-[var(--muted)] text-[var(--foreground)] truncate">
+              {loading ? "Loading…" : revealed ? (masked ? "•".repeat(Math.min(revealed.length, 16)) : revealed) : "••••••••"}
+            </code>
+            <Button variant="ghost" size="icon" className="h-6 w-6" title={masked ? "Reveal" : "Hide"} onClick={handleReveal} disabled={loading}>
+              {masked ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+            </Button>
+            <Button variant="ghost" size="icon" className="h-6 w-6" title="Copy" onClick={handleCopy} disabled={!revealed}>
+              {copied ? <Check className="w-3.5 h-3.5 text-[var(--success)]" /> : <Copy className="w-3.5 h-3.5" />}
+            </Button>
+          </div>
+          {error && <div className="text-[var(--error)] mt-1">{error}</div>}
+          {copied && <div className="text-[var(--success)] mt-1">Copied</div>}
+        </span>
+      )}
+    </span>
+  );
 }
 
 function CodexQuotaCell({ codex, fallbackRemaining, fallbackLimit }: { codex?: CodexQuotaMetadata; fallbackRemaining?: number; fallbackLimit?: number }) {
@@ -275,6 +364,13 @@ export default function AccountList() {
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  // Test dialog state
+  const [testDialog, setTestDialog] = useState<{ accountId: number; email: string } | null>(null);
+  const [testModels, setTestModels] = useState<Array<{ id: string; vision?: boolean; thinking?: boolean; creditRate?: number }>>([]);
+  const [testModelPick, setTestModelPick] = useState<string>("");
+  const [testModelsLoading, setTestModelsLoading] = useState(false);
+  const [testRunning, setTestRunning] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; text: string } | null>(null);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -319,6 +415,68 @@ export default function AccountList() {
       showSuccess(res.message || "WarmUp All queued.");
       await load();
     } catch (err) { showError(err); }
+  }
+
+  // Open the Test dialog for an account — fetches the provider's model list.
+  async function handleTest(id: number, email: string) {
+    setTestDialog({ accountId: id, email });
+    setTestModels([]);
+    setTestModelPick("");
+    setTestResult(null);
+    setTestModelsLoading(true);
+    try {
+      const res = await fetchAccountModels(id);
+      setTestModels(res.models || []);
+      setTestModelPick(res.default || res.models?.[0]?.id || "");
+    } catch (err) {
+      showError(err);
+      setTestDialog(null);
+    } finally {
+      setTestModelsLoading(false);
+    }
+  }
+
+  // Run the actual test with the selected model.
+  async function runTest() {
+    if (!testDialog) return;
+    setTestRunning(true);
+    setTestResult(null);
+    try {
+      const res = await testAccount(testDialog.accountId, testModelPick || undefined);
+      if (res.success) {
+        const bits = [
+          res.message || "Test passed",
+          res.model ? `model: ${res.model}` : "",
+          res.latency_ms != null ? `${res.latency_ms}ms` : "",
+          res.credits_used != null ? `${res.credits_used} credits` : "",
+          res.reactivated ? "reactivated → active" : "",
+        ].filter(Boolean).join(" · ");
+        setTestResult({ success: true, text: bits });
+        showSuccess(bits);
+        await load();
+      } else {
+        // Distinguish "still exhausted upstream" from a real config/auth error.
+        const label = res.still_exhausted
+          ? `Akun masih exhausted upstream (credit habis). ${res.error || ""}`
+          : (res.error || "Test failed");
+        setTestResult({ success: false, text: label });
+        showError(new Error(label));
+      }
+    } catch (err) {
+      const text = err instanceof Error ? err.message : "Test error";
+      setTestResult({ success: false, text });
+      showError(err);
+    } finally {
+      setTestRunning(false);
+    }
+  }
+
+  function closeTestDialog() {
+    setTestDialog(null);
+    setTestModels([]);
+    setTestModelPick("");
+    setTestResult(null);
+    setTestRunning(false);
   }
 
   async function handleLogin(id: number) {
@@ -617,7 +775,10 @@ export default function AccountList() {
                       />
                     </td>
                     <td className="p-4 text-sm text-[var(--foreground)]">
-                      <div>{account.email}</div>
+                      <div className="inline-flex items-center">
+                        {account.email}
+                        <ApiKeyCell account={account} />
+                      </div>
                       {account.errorMessage && <div className="text-xs text-[var(--error)] mt-1 line-clamp-1" title={account.errorMessage}>{account.errorMessage}</div>}
                     </td>
                     <td className="p-4"><Badge variant={statusVariants[account.status]}>{account.status}</Badge></td>
@@ -655,6 +816,9 @@ export default function AccountList() {
                             <ExternalLink className="w-4 h-4 text-[var(--info)]" />
                           </Button>
                         )}
+                        <Button variant="ghost" size="icon" onClick={() => handleTest(account.id, account.email)} title="Test account (prompt 'hallo')">
+                          <FlaskConical className="w-4 h-4 text-[var(--info)]" />
+                        </Button>
                         <Button variant="ghost" size="icon" onClick={() => handleWarmup(account.id)} title="WarmUp">
                           <RefreshCw className="w-4 h-4 text-[var(--warning)]" />
                         </Button>
@@ -689,6 +853,48 @@ export default function AccountList() {
           )}
         </CardContent>
       </Card>
+
+      {/* Test Account Dialog */}
+      <Dialog open={!!testDialog} onOpenChange={(o) => { if (!o) closeTestDialog(); }}>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle>Test Account — {testDialog?.email}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div>
+              <label className="text-sm text-[var(--foreground)]">Model</label>
+              <Select
+                value={testModelPick}
+                onChange={(e) => setTestModelPick(e.target.value)}
+                disabled={testModelsLoading || testRunning}
+                className="mt-1"
+              >
+                {testModelsLoading && <option value="">Loading models…</option>}
+                {!testModelsLoading && testModels.length === 0 && <option value="">No models</option>}
+                {testModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id}{m.vision ? " · vision" : ""}{m.thinking ? " · thinking" : ""}{m.creditRate != null ? ` · ${m.creditRate}/cr` : ""}
+                  </option>
+                ))}
+              </Select>
+              <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                Mengirim prompt <code>"hallo"</code> dengan <code>max_tokens:1</code>. Credit terpakai minimal.
+              </p>
+            </div>
+            {testResult && (
+              <div className={`rounded-md p-3 text-sm ${testResult.success ? "bg-[var(--success)]/10 text-[var(--success)]" : "bg-[var(--error)]/10 text-[var(--error)]"}`}>
+                {testResult.success ? "✓ " : "✗ "}{testResult.text}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={closeTestDialog} disabled={testRunning}>Close</Button>
+            <Button onClick={runTest} disabled={testRunning || testModelsLoading || !testModelPick}>
+              {testRunning ? (<><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Testing…</>) : "Run Test"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

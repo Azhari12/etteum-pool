@@ -140,11 +140,30 @@ export async function routeRequest(
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     // BYOK uses prefix-based account lookup (not the generic pool),
     // so it can also find error-status accounts and retry them.
-    const account = providerName === "byok"
+    let account = providerName === "byok"
       ? (await pool.getAccountForModel(compressedRequest.model, {
           excludeAccountIds: attemptedByokAccountIds,
         }))?.account ?? null
       : await pool.getNextAccount(providerName);
+
+    // Track BYOK exhausted-fallback attempts so the same exhausted key isn't
+    // retried within the same refresh cycle. BYOK's exhausted tier lives inside
+    // findAccountForModel; we just record the attempt here for cycle tracking.
+    if (account && providerName === "byok" && account.status === "exhausted") {
+      pool.markExhaustedTried("byok", account.id);
+    }
+
+    // Fallback for non-BYOK: no active account available — try an exhausted
+    // account once per refresh cycle (respects 24h grace period inside
+    // getExhaustedFallbackAccount). BYOK handles its own exhausted tier above.
+    if (!account && providerName !== "byok") {
+      const exhausted = await pool.getExhaustedFallbackAccount(providerName);
+      if (exhausted) {
+        pool.markExhaustedTried(providerName, exhausted.id);
+        account = exhausted;
+      }
+    }
+
     if (!account) {
       throw new Error(
         `No active accounts available for provider: ${providerName}`
@@ -170,6 +189,12 @@ export async function routeRequest(
           await pool.updateTokens(account.id, result.tokens);
         }
         await pool.markUsed(account.id);
+        // Reactivate an account that was served from the exhausted fallback
+        // tier — the request succeeded, so the account is actually usable.
+        // Driven by real request outcome, NOT by the quota tracker.
+        if (account.status === "exhausted") {
+          await pool.markActiveFromExhausted(account.id);
+        }
         return { result, account, provider: providerName, durationMs, compressionStats };
       }
 
@@ -227,6 +252,9 @@ export async function routeRequest(
 
           if (retryResult.success) {
             await pool.markUsed(account.id);
+            if (account.status === "exhausted") {
+              await pool.markActiveFromExhausted(account.id);
+            }
             return {
               result: retryResult,
               account,
