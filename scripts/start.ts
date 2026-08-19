@@ -1,6 +1,8 @@
-const root = new URL("..", import.meta.url).pathname.replace(/^\/([A-Z]:)/i, "$1");
+const root = decodeURIComponent(new URL("..", import.meta.url).pathname.replace(/^\/([A-Z]:)/i, "$1"));
 const port = process.env.PORT || "1930";
 const dashboardPort = process.env.DASHBOARD_PORT || "1931";
+
+const bunExe = process.execPath;
 
 function spawnProcess(name: string, command: string[], cwd = root) {
   const proc = Bun.spawn(command, {
@@ -10,8 +12,7 @@ function spawnProcess(name: string, command: string[], cwd = root) {
       PORT: port,
       DASHBOARD_PORT: dashboardPort,
     },
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
   const prefix = `[${name}]`;
@@ -68,10 +69,11 @@ console.log(`Backend:   http://localhost:${port}`);
 console.log(`Dashboard: http://localhost:${dashboardPort}`);
 console.log(`API Key:   ${process.env.API_KEY || "pool-proxy-secret-key"}\n`);
 
-children.push(spawnProcess("backend", ["bun", "src/index.ts"]));
+children.push(spawnProcess("backend", [bunExe, "src/index.ts"]));
 children.push(
   spawnProcess("dashboard", [
-    "bunx",
+    bunExe,
+    "x",
     "vite",
     "--host",
     "0.0.0.0",

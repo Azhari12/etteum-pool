@@ -152,7 +152,7 @@ app.get("/api/info", (c) => {
 });
 
 // Serve dashboard static files (SPA fallback)
-const dashboardDist = new URL("../dashboard/dist", import.meta.url).pathname.replace(/^\/([A-Z]:)/i, "$1");
+const dashboardDist = decodeURIComponent(new URL("../dashboard/dist", import.meta.url).pathname.replace(/^\/([A-Z]:)/i, "$1"));
 const dashboardIndex = `${dashboardDist}/index.html`;
 
 const staticMimeTypes: Record<string, string> = {
