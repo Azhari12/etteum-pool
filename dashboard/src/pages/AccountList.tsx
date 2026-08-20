@@ -58,6 +58,7 @@ interface Account {
   lastLoginAt?: string | null;
   errorMessage?: string | null;
   hasApiKey?: boolean;
+  exhaustedCheckedAt?: string | null;
   metadata?: {
     codex_quota?: CodexQuotaMetadata;
     overage?: { enabled: boolean; capable: boolean; used: number; cap: number; remaining: number } | null;
@@ -781,7 +782,11 @@ export default function AccountList() {
                       </div>
                       {account.errorMessage && <div className="text-xs text-[var(--error)] mt-1 line-clamp-1" title={account.errorMessage}>{account.errorMessage}</div>}
                     </td>
-                    <td className="p-4"><Badge variant={statusVariants[account.status]}>{account.status}</Badge></td>
+                    <td className="p-4">
+                      <Badge variant={statusVariants[account.status]} title={account.exhaustedCheckedAt ? `Checked ${formatDate(account.exhaustedCheckedAt)}` : undefined}>
+                        {account.status}{account.status === "exhausted" && account.exhaustedCheckedAt ? " (checked)" : ""}
+                      </Badge>
+                    </td>
                     <td className="p-4">
                       <button
                         type="button"

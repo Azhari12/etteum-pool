@@ -223,7 +223,14 @@ export async function routeRequest(
       // occasional false-exhaust (lifted within one warmup cycle) in
       // exchange for never serving a known-bad account on retry.
       if (result.quotaExhausted) {
+        // If this account was served from the exhausted-fallback tier (its
+        // status was already "exhausted" before this attempt), the probe just
+        // confirmed it is still out of credits upstream — stamp it checked.
+        const wasExhaustedFallback = account.status === "exhausted";
         await pool.markExhausted(account.id);
+        if (wasExhaustedFallback) {
+          await pool.markExhaustedChecked(account.id);
+        }
         lastError = result.error || "Quota exhausted";
         continue; // Try next account
       }

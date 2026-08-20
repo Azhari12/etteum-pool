@@ -226,12 +226,17 @@ accountsRouter.get("/", async (c) => {
 
 	// Don't expose passwords in response. Flag whether this account exposes an
 	// API key (only BYOK accounts do — non-BYOK use email/password via auth bot).
-	const sanitized = allAccounts.map((acc) => ({
-		...acc,
-		password: "***",
-		tokens: acc.tokens ? "[set]" : null,
-		hasApiKey: acc.provider === "byok" || acc.provider === "codebuddy-china",
-	}));
+	const sanitized = allAccounts.map((acc) => {
+		const meta = (acc.metadata ?? {}) as Record<string, unknown>;
+		return {
+			...acc,
+			password: "***",
+			tokens: acc.tokens ? "[set]" : null,
+			metadata: acc.metadata ?? null,
+			hasApiKey: acc.provider === "byok" || acc.provider === "codebuddy-china",
+			exhaustedCheckedAt: typeof meta.exhaustedCheckedAt === "string" ? meta.exhaustedCheckedAt : null,
+		};
+	});
 
 	return c.json({ data: sanitized, total: sanitized.length });
 });
@@ -1634,6 +1639,11 @@ accountsRouter.post("/:id/test", async (c) => {
 			/quota|exhaust|429|insufficient.*credit|余额不足|额度|credit/i.test(
 				rawErr,
 			);
+		// Stamp the account as checked if the probe confirmed it is still
+		// exhausted — so the UI can render "exhausted (checked)".
+		if (stillExhausted && account.status === "exhausted") {
+			await pool.markExhaustedChecked(id);
+		}
 		return c.json({
 			success: false,
 			error:

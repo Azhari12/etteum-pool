@@ -449,11 +449,23 @@ class AccountPool {
    * request served by an exhausted-account fallback succeeds.
    */
   async markActiveFromExhausted(accountId: number): Promise<void> {
+    // Clear the exhausted-checked stamp on reactivation so a future exhaust
+    // cycle starts unchecked again.
+    const [existing] = await db
+      .select({ metadata: accounts.metadata })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .limit(1);
+    const prev = (existing?.metadata ?? {}) as Record<string, unknown>;
+    if (prev.exhaustedCheckedAt) {
+      delete prev.exhaustedCheckedAt;
+    }
     const [account] = await db
       .update(accounts)
       .set({
         status: "active",
         errorMessage: null,
+        metadata: prev,
         updatedAt: new Date(),
       })
       .where(eq(accounts.id, accountId))
@@ -489,6 +501,31 @@ class AccountPool {
         data: { id: accountId, status: "exhausted", provider: account.provider },
       });
     }
+  }
+
+  /**
+   * Record that an exhausted account has been probed (via the one-shot
+   * fallback retry OR the Test button) and confirmed to STILL be exhausted
+   * upstream. Stamps `metadata.exhaustedCheckedAt` so the UI can render
+   * `exhausted (checked)` — distinguishing "verified still out of credits"
+   * from "never re-checked this cycle".
+   */
+  async markExhaustedChecked(accountId: number): Promise<void> {
+    const [existing] = await db
+      .select({ metadata: accounts.metadata })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .limit(1);
+    const prev = (existing?.metadata ?? {}) as Record<string, unknown>;
+    const metadata = { ...prev, exhaustedCheckedAt: new Date().toISOString() };
+    await db
+      .update(accounts)
+      .set({ metadata, updatedAt: new Date() })
+      .where(eq(accounts.id, accountId));
+    broadcast({
+      type: "account_status",
+      data: { id: accountId, status: "exhausted", checked: true },
+    });
   }
 
   /**
