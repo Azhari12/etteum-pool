@@ -131,6 +131,13 @@ export class ByokProvider extends BaseProvider {
           owned_by: `byok:${prefix}`,
           context_window: 200_000,
           max_output: 8192,
+          // BYOK upstream capability is opaque to the proxy — we don't know
+          // which models support vision. Default to true so the router's
+          // vision gate doesn't reject image requests before they even reach
+          // the upstream (which is the real arbiter). If the upstream model
+          // is text-only, the upstream returns its own error on the request.
+          vision: true,
+          thinking: false,
         });
       }
     }
@@ -386,6 +393,91 @@ export class ByokProvider extends BaseProvider {
 
   // ── OpenAI-compatible ──────────────────────────────────────────────
 
+  /**
+   * Normalize an upstream `delta.content` / `content` value into a plain
+   * string. Some BYOK upstreams stream content as an array of content blocks
+   * (`[{type:"text", text:"..."}]`) or a bare object; concatenating such a
+   * value with += would coerce via String() and yield "[object Object]" in
+   * the final response. (Same fix as CodeBuddy CN's normalizeContent.)
+   */
+  private normalizeDeltaContent(content: unknown): string {
+    if (content == null) return "";
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((block: any) => {
+          if (block == null) return "";
+          if (typeof block === "string") return block;
+          if (typeof block.text === "string") return block.text;
+          if (typeof block.content === "string") return block.content;
+          if (typeof block === "object") return this.normalizeDeltaContent(block);
+          return "";
+        })
+        .filter(Boolean)
+        .join("");
+    }
+    if (typeof content === "object") {
+      const obj = content as any;
+      if (typeof obj.text === "string") return obj.text;
+      if (typeof obj.content === "string") return obj.content;
+      if (obj.content != null) return this.normalizeDeltaContent(obj.content);
+    }
+    return "";
+  }
+
+  /**
+   * Normalize a request's messages for an OpenAI-compatible upstream.
+   *
+   * Clients (the assistant CLI) send images in Anthropic shape:
+   *   { type: "image", source: { type: "base64", media_type, data } }
+   * OpenAI-compatible endpoints expect:
+   *   { type: "image_url", image_url: { url: "data:<mime>;base64,<data>" } }
+   * Without this conversion, BYOK image requests were being rejected upstream
+   * with a generic "unsupported content" error that looked like the model
+   * lacked vision — but it was really a format mismatch. (See CodeBuddy CN
+   * provider's cleanMessages for the same conversion.)
+   *
+   * Pure-text array content is collapsed back to a plain string for backwards
+   * compatibility with non-vision OpenAI models that reject array content.
+   */
+  private normalizeMessagesForOpenAI(messages: any[]): any[] {
+    return messages.map((msg) => {
+      if (!Array.isArray(msg.content)) return msg;
+
+      const output: any[] = [];
+      for (const block of msg.content) {
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "text") {
+          output.push({ type: "text", text: block.text || "" });
+        } else if (block.type === "image_url" && block.image_url) {
+          // Already OpenAI shape — pass through (normalize url field).
+          const url = typeof block.image_url === "string"
+            ? block.image_url
+            : block.image_url.url;
+          if (url) output.push({ type: "image_url", image_url: { url } });
+        } else if (block.type === "image" && block.source) {
+          // Anthropic shape → OpenAI image_url with data URL.
+          const dataUrl = block.source.type === "base64"
+            ? `data:${block.source.media_type || "image/png"};base64,${block.source.data}`
+            : block.source.url || "";
+          if (dataUrl) {
+            output.push({ type: "image_url", image_url: { url: dataUrl } });
+          }
+        }
+        // Other block types (tool_use, tool_result, etc.) are handled by
+        // toOpenAIRequest elsewhere for OpenAI wire format; here we only fix
+        // images so we don't regress the existing tool-call path.
+      }
+
+      // Collapse to plain string if only text blocks remain.
+      const hasOnlyText = output.length > 0 && output.every((b) => b.type === "text");
+      if (hasOnlyText) {
+        return { ...msg, content: output.map((b) => b.text).join("\n") };
+      }
+      return { ...msg, content: output };
+    });
+  }
+
   private async chatCompletionOpenAI(
     account: Account,
     tokens: ByokTokens,
@@ -407,6 +499,12 @@ export class ByokProvider extends BaseProvider {
       stream: false,
     };
     this.appendOptionalParams(body, request);
+
+    // Convert Anthropic-shape image blocks → OpenAI image_url so vision works
+    // against OpenAI-compatible BYOK upstreams.
+    if (Array.isArray(body.messages)) {
+      body.messages = this.normalizeMessagesForOpenAI(body.messages);
+    }
 
     try {
       const response = await this.fetchWithTimeout(url, {
@@ -461,10 +559,14 @@ export class ByokProvider extends BaseProvider {
             if (!chunkModel && chunk.model) chunkModel = chunk.model;
             if (!created && chunk.created) created = chunk.created;
             
-            // Aggregate content from delta
+            // Aggregate content from delta. Some upstreams stream `content`
+            // as an array of blocks or a bare object instead of a string —
+            // concatenating those with += would coerce to "[object Object]".
+            // Normalize to a real string first (mirrors CodeBuddy CN's
+            // normalizeContent).
             const delta = chunk.choices?.[0]?.delta;
-            if (delta?.content) {
-              aggregatedContent += delta.content;
+            if (delta?.content != null) {
+              aggregatedContent += this.normalizeDeltaContent(delta.content);
             }
             
             // Capture finish reason
@@ -518,7 +620,14 @@ export class ByokProvider extends BaseProvider {
         };
       }
 
-      const data = (await response.json()) as ChatCompletionResponse;
+      const data = (await response.json()) as any;
+      // Upstream may return { error: {...} } instead of choices (e.g. pool
+      // upstream with no active accounts for the model). Surface the real reason.
+      if (data?.error) {
+        const errMsg = data.error.message || data.error.code || "Upstream error";
+        console.warn(`[BYOK] upstream error for model ${request.model} (account ${account.email}): ${errMsg}`);
+        return { success: false, error: `upstream: ${errMsg}` };
+      }
       const choice = data.choices?.[0];
       if (!choice) return { success: false, error: "No choices in response" };
 
@@ -565,6 +674,11 @@ export class ByokProvider extends BaseProvider {
     };
     this.appendOptionalParams(body, request);
 
+    // Convert Anthropic-shape image blocks → OpenAI image_url (vision support).
+    if (Array.isArray(body.messages)) {
+      body.messages = this.normalizeMessagesForOpenAI(body.messages);
+    }
+
     try {
       const response = await this.fetchWithTimeout(url, {
         method: "POST",
@@ -589,12 +703,14 @@ export class ByokProvider extends BaseProvider {
       const model = request.model;
       const encoder = new TextEncoder();
       const upstream = response.body;
+      const self = this;
 
       const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
           const reader = upstream.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
+          let sawAnyChunk = false;
 
           try {
             while (true) {
@@ -618,13 +734,63 @@ export class ByokProvider extends BaseProvider {
 
                 try {
                   const chunk = JSON.parse(payload);
+
+                  // Some upstreams (e.g. nrimoae.dev, which is itself a pool)
+                  // stream an error object instead of a choices array when the
+                  // underlying model/account is unavailable. Surface it as a
+                  // stream error so the client doesn't receive a silent empty
+                  // completion — and log the real upstream reason.
+                  if (chunk.error) {
+                    const errMsg = chunk.error.message || chunk.error.code || "upstream error";
+                    console.warn(`[BYOK] upstream stream error for model ${model} (account ${account.email}): ${errMsg}`);
+                    const errChunk = {
+                      id,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model,
+                      choices: [{
+                        index: 0,
+                        delta: { content: `[upstream error: ${errMsg}]` },
+                        finish_reason: "stop",
+                      }],
+                    };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                    return;
+                  }
+
                   chunk.model = model;
                   chunk.id = id;
+                  // Normalize delta.content that some upstreams send as an
+                  // array/object into a plain string before passthrough.
+                  const delta = chunk.choices?.[0]?.delta;
+                  if (delta?.content != null) {
+                    const normalized = self.normalizeDeltaContent(delta.content);
+                    if (normalized) delta.content = normalized;
+                    else delete delta.content;
+                  }
+                  sawAnyChunk = true;
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 } catch { /* skip malformed */ }
               }
             }
 
+            // Fallback: upstream closed without ever emitting a chunk (some
+            // providers return an empty SSE body or close immediately). Synthesize
+            // a minimal empty-content chunk + [DONE] so the client doesn't hang
+            // waiting for content that will never arrive.
+            if (!sawAnyChunk) {
+              console.warn(`[BYOK] upstream returned no stream chunks for model ${model} (account ${account.email}) — synthesizing empty completion`);
+              const empty = {
+                id,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }],
+              };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(empty)}\n\n`));
+            }
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
           } catch (err) {
@@ -769,6 +935,29 @@ export class ByokProvider extends BaseProvider {
     if (request.temperature !== undefined) body.temperature = request.temperature;
     if (request.top_p !== undefined) body.top_p = request.top_p;
 
+    // Pass tools through in Anthropic's native format so the upstream can
+    // emit tool_use blocks. Without this the model has no tools to call,
+    // producing empty/malformed tool calls. Convert from OpenAI function
+    // schema shape (request.tools = [{ type:"function", function:{name,description,parameters} }])
+    // to Anthropic shape ({ name, description, input_schema }).
+    if (Array.isArray(request.tools) && request.tools.length > 0) {
+      body.tools = request.tools.map((t: any) => ({
+        name: t?.function?.name || t?.name,
+        description: t?.function?.description || t?.description,
+        input_schema: t?.function?.parameters || t?.input_schema || { type: "object", properties: {} },
+      })).filter((t: any) => t.name);
+    }
+    if (request.tool_choice) {
+      // OpenAI tool_choice variants → Anthropic. Object {type:"function",function:{name}}
+      // → {type:"tool",name}. "auto"/"none"/"required" pass through.
+      const tc = request.tool_choice as any;
+      if (typeof tc === "string") {
+        body.tool_choice = tc === "required" ? "any" : tc;
+      } else if (tc?.type === "function" && tc?.function?.name) {
+        body.tool_choice = { type: "tool", name: tc.function.name };
+      }
+    }
+
     return body;
   }
 
@@ -828,6 +1017,18 @@ export class ByokProvider extends BaseProvider {
     let outputTokens = 0;
     let started = false;
 
+    // Track tool blocks being streamed. Anthropic sends:
+    //   content_block_start { content_block: { type:"tool_use", id, name, input:{} } }
+    //   content_block_delta  { delta: { type:"input_json_delta", partial_json } }
+    //   content_block_stop
+    // Convert to OpenAI streaming tool_calls shape so the proxy's
+    // openAIStreamToAnthropic transform can turn it back into Anthropic
+    // tool_use for the client. Without this, tool calls from an
+    // Anthropic-format BYOK upstream were silently dropped → "empty tool
+    // call" / stuck-response loops.
+    const toolBlocks = new Map<number, { callIndex: number; id: string; name: string }>();
+    let nextToolCallIndex = 0;
+
     const makeChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
       const chunk = {
         id,
@@ -872,17 +1073,64 @@ export class ByokProvider extends BaseProvider {
                   }
                 }
 
+                if (event.type === "content_block_start") {
+                  const block = event.content_block;
+                  if (block?.type === "tool_use") {
+                    const callIndex = nextToolCallIndex++;
+                    toolBlocks.set(event.index, {
+                      callIndex,
+                      id: block.id || `call_${callIndex}`,
+                      name: block.name || "",
+                    });
+                    // Emit the tool call start with name + empty arguments.
+                    controller.enqueue(makeChunk({
+                      tool_calls: [{
+                        index: callIndex,
+                        id: block.id || `call_${callIndex}`,
+                        type: "function",
+                        function: { name: block.name || "", arguments: "" },
+                      }],
+                    }));
+                  }
+                }
+
                 if (event.type === "content_block_delta") {
-                  const text = event.delta?.text || "";
-                  if (text) controller.enqueue(makeChunk({ content: text }));
+                  const delta = event.delta;
+                  if (delta?.type === "text_delta" && delta.text) {
+                    controller.enqueue(makeChunk({ content: delta.text }));
+                  } else if (delta?.type === "input_json_delta" && typeof delta.partial_json === "string") {
+                    // Stream tool-call arguments incrementally.
+                    const tb = toolBlocks.get(event.index);
+                    if (tb) {
+                      controller.enqueue(makeChunk({
+                        tool_calls: [{
+                          index: tb.callIndex,
+                          function: { arguments: delta.partial_json },
+                        }],
+                      }));
+                    }
+                  }
+                }
+
+                if (event.type === "content_block_stop") {
+                  // Tool block complete — nothing to emit (OpenAI closes by
+                  // finish_reason). Text block already streamed via deltas.
                 }
 
                 if (event.type === "message_delta") {
                   outputTokens = event.usage?.output_tokens || 0;
+                  // Map Anthropic stop_reason → OpenAI finish_reason.
+                  const stopReason = event.delta?.stop_reason;
+                  if (stopReason === "tool_use") {
+                    controller.enqueue(makeChunk({}, "tool_calls"));
+                  } else if (stopReason === "end_turn" || stopReason === "stop_sequence") {
+                    controller.enqueue(makeChunk({}, "stop"));
+                  } else if (stopReason === "max_tokens") {
+                    controller.enqueue(makeChunk({}, "length"));
+                  }
                 }
 
                 if (event.type === "message_stop") {
-                  controller.enqueue(makeChunk({}, "stop"));
                   controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                   controller.close();
                   return;
