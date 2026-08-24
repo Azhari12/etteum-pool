@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { routeRequest, getAllModels, providers } from "./router";
+import { routeRequest, getAllModels, providers, AllAccountsFailedError } from "./router";
 import { db } from "../db/index";
 import { requestLogs, usageSummary, accounts, type NewRequestLog } from "../db/schema";
 import { pool } from "./pool";
@@ -219,6 +219,84 @@ function openAIErrorResponse(message: string, status: 400 | 503) {
       type: status === 400 ? "invalid_request_error" : "server_error",
       code: status === 400 ? "invalid_json" : "proxy_error",
     },
+  };
+}
+
+interface ProxyErrorShape {
+  /** Message surfaced to the client — includes the upstream body when we have one. */
+  message: string;
+  status: 400 | 429 | 502 | 503;
+  type: string;
+  code: string;
+  /** Upstream diagnostics, attached to the response so callers can see the cause. */
+  upstream?: {
+    provider: string;
+    /** Upstream HTTP status, when the provider's error carried a parseable one. */
+    status?: number;
+    attempts: number;
+    account?: string;
+    rateLimited?: boolean;
+    quotaExhausted?: boolean;
+    error: string;
+  };
+}
+
+/**
+ * Turn a routing failure into an honest client-facing error.
+ *
+ * Previously every non-model failure collapsed into a bare 503 "proxy_error",
+ * which hid whether the upstream returned 429, 502, or a real request problem.
+ * AllAccountsFailedError carries the upstream status and body, so we propagate
+ * both: the status the caller should act on, plus the raw upstream text.
+ */
+function describeProxyError(error: unknown, errorMessage: string): ProxyErrorShape {
+  const invalidModel = isInvalidModelError(errorMessage);
+  const badUpstreamRequest = isBadUpstreamRequest(errorMessage);
+
+  if (invalidModel || badUpstreamRequest) {
+    return {
+      message: errorMessage,
+      status: 400,
+      type: "invalid_request_error",
+      code: invalidModel ? "invalid_model" : "invalid_request",
+    };
+  }
+
+  if (error instanceof AllAccountsFailedError) {
+    const upstreamStatus = error.upstreamStatus;
+    // Map the failure onto something the caller can act on: rate limits and
+    // quota exhaustion become 429 so clients back off, upstream 5xx becomes 502
+    // (we are the gateway), everything else stays 503 (no usable account). The
+    // provider flags come first — a 429 body often carries no parseable status.
+    const status: 429 | 502 | 503 =
+      error.rateLimited || error.quotaExhausted || upstreamStatus === 429
+        ? 429
+        : upstreamStatus !== null && upstreamStatus >= 500
+          ? 502
+          : 503;
+
+    return {
+      message: error.message,
+      status,
+      type: status === 429 ? "rate_limit_error" : "server_error",
+      code: status === 429 ? "rate_limit_exceeded" : "upstream_error",
+      upstream: {
+        provider: error.provider,
+        status: upstreamStatus ?? undefined,
+        attempts: error.attempts,
+        account: error.lastAccountEmail,
+        ...(error.rateLimited ? { rateLimited: true } : {}),
+        ...(error.quotaExhausted ? { quotaExhausted: true } : {}),
+        error: error.upstreamError,
+      },
+    };
+  }
+
+  return {
+    message: errorMessage,
+    status: 503,
+    type: "server_error",
+    code: "proxy_error",
   };
 }
 
@@ -678,6 +756,7 @@ proxyRouter.post("/v1/chat/completions", async (c) => {
     const errorMessage =
       error instanceof Error ? error.message : String(error);
     const mappedModel = resolveModelAlias(normalizeModelId(body.model));
+    const described = describeProxyError(error, errorMessage);
 
     // Log the error without masking the original proxy failure.
     const provider = pool.getProviderForModel(mappedModel) || "unknown";
@@ -687,27 +766,25 @@ proxyRouter.post("/v1/chat/completions", async (c) => {
       status: "error",
       errorMessage,
       requestBody: prepareLogBody({ ...body, model: mappedModel, _poolprox: { originalModel: body.model } }),
-      responseBody: prepareLogBody({ error: errorMessage }),
+      responseBody: prepareLogBody({ error: errorMessage, upstream: described.upstream }),
       durationMs: 0,
     }, "chat completion error");
 
     broadcast({
       type: "request_error",
-      data: { model: mappedModel, error: errorMessage },
+      data: { model: mappedModel, error: errorMessage, upstream: described.upstream },
     });
-
-    const invalidModel = isInvalidModelError(errorMessage);
-    const badUpstreamRequest = isBadUpstreamRequest(errorMessage);
 
     return c.json(
       {
         error: {
-          message: errorMessage,
-          type: invalidModel || badUpstreamRequest ? "invalid_request_error" : "server_error",
-          code: invalidModel ? "invalid_model" : badUpstreamRequest ? "invalid_request" : "proxy_error",
+          message: described.message,
+          type: described.type,
+          code: described.code,
+          ...(described.upstream ? { upstream: described.upstream } : {}),
         },
       },
-      invalidModel || badUpstreamRequest ? 400 : 503
+      described.status
     );
   }
 });
@@ -755,6 +832,7 @@ proxyRouter.post("/v1/messages", async (c) => {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const mappedModel = resolveModelAlias(normalizeModelId(body.model));
+    const described = describeProxyError(error, errorMessage);
     const provider = pool.getProviderForModel(mappedModel) || "unknown";
     await logProxyError({
       provider,
@@ -762,20 +840,19 @@ proxyRouter.post("/v1/messages", async (c) => {
       status: "error",
       errorMessage,
       requestBody: prepareLogBody({ ...body, model: mappedModel, _poolprox: { originalModel: body.model } }),
-      responseBody: prepareLogBody({ error: errorMessage }),
+      responseBody: prepareLogBody({ error: errorMessage, upstream: described.upstream }),
       durationMs: 0,
     }, "messages error");
 
-    broadcast({ type: "request_error", data: { model: mappedModel, error: errorMessage } });
+    broadcast({ type: "request_error", data: { model: mappedModel, error: errorMessage, upstream: described.upstream } });
 
-    const invalidModel = isInvalidModelError(errorMessage);
-    const badUpstreamRequest = isBadUpstreamRequest(errorMessage);
     return c.json({
       type: "error",
       error: {
-        type: invalidModel || badUpstreamRequest ? "invalid_request_error" : "api_error",
-        message: errorMessage,
+        type: described.status === 400 ? "invalid_request_error" : described.status === 429 ? "rate_limit_error" : "api_error",
+        message: described.message,
+        ...(described.upstream ? { upstream: described.upstream } : {}),
       },
-    }, invalidModel || badUpstreamRequest ? 400 : 503);
+    }, described.status);
   }
 });

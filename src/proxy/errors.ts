@@ -1,3 +1,21 @@
+/**
+ * Pull an HTTP status code out of a provider error string.
+ *
+ * Providers format upstream failures inconsistently — BYOK emits
+ * "HTTP 502: <body>", others emit "(502)" or "status 502" — so classification
+ * has to handle every shape. Matching only one of them silently mis-sorts the
+ * rest (a 502 gets treated as a permanent account failure instead of a
+ * transient upstream blip).
+ */
+export function extractHttpStatus(error?: string): number | null {
+  if (!error) return null;
+  const match =
+    error.match(/\bhttp[\s/]*(?:status[\s:]*)?([1-5]\d{2})\b/i) ||
+    error.match(/\bstatus(?:\s*code)?[\s:=]*([1-5]\d{2})\b/i) ||
+    error.match(/\(([1-5]\d{2})\)/);
+  return match ? Number(match[1]) : null;
+}
+
 export function isInvalidModelError(error?: string): boolean {
   if (!error) return false;
   const normalized = error.toLowerCase();
@@ -48,6 +66,17 @@ export function isNonAccountRequestError(error?: string): boolean {
 }
 
 /**
+ * Upstream statuses that mean "try again / try elsewhere", not "bad account".
+ *
+ * 400 is included because a malformed-request complaint is never the account's
+ * fault — the genuinely unrecoverable 400s (invalid model, moderation, bad
+ * params) are caught earlier by isNonAccountRequestError, which stops the retry
+ * loop outright. 401/403/404 are deliberately absent: those point at the
+ * account's credentials or base_url and should mark it.
+ */
+const TRANSIENT_STATUSES = new Set([400, 408, 425, 429, 500, 502, 503, 504, 522, 524]);
+
+/**
  * Transient errors that are temporary and should not permanently mark an account as errored.
  * These include network issues, timeouts, rate limits, upstream server errors,
  * and bad-request errors that are caused by the request format (not the account).
@@ -56,6 +85,12 @@ export function isNonAccountRequestError(error?: string): boolean {
 export function isTransientError(error?: string): boolean {
   if (!error) return false;
   const normalized = error.toLowerCase();
+
+  // Status-code first: covers every provider's formatting ("HTTP 502: ...",
+  // "(502)", "status 502") instead of only the parenthesised variant.
+  const status = extractHttpStatus(error);
+  if (status !== null && TRANSIENT_STATUSES.has(status)) return true;
+
   return (
     // Network / connectivity
     normalized.includes("timeout") ||
@@ -73,10 +108,6 @@ export function isTransientError(error?: string): boolean {
     normalized.includes("eai again") ||
     normalized.includes("temporary failure") ||
     // Upstream server errors (not account-specific)
-    normalized.includes("(500)") ||
-    normalized.includes("(502)") ||
-    normalized.includes("(503)") ||
-    normalized.includes("(504)") ||
     normalized.includes("internal server error") ||
     normalized.includes("bad gateway") ||
     normalized.includes("service unavailable") ||
@@ -84,14 +115,13 @@ export function isTransientError(error?: string): boolean {
     // Rate limiting (temporary)
     normalized.includes("rate limit") ||
     normalized.includes("too many requests") ||
-    normalized.includes("(429)") ||
     // Bad request format (not account issue — request content caused it)
     normalized.includes("parse message failed") ||
     normalized.includes("invalid request") ||
-    normalized.includes("(400)") ||
-    // Stream errors (temporary)
-    normalized.includes("stream error") ||
-    normalized.includes("stream read timeout") ||
-    normalized.includes("stream failed")
+    // Stream errors (temporary). Word-anchored so an upstream message ending in
+    // "...upstream error" is not swallowed by the "stream error" substring.
+    /\bstream (error|failed)\b/.test(normalized) ||
+    normalized.includes("stream read timeout")
   );
 }
+

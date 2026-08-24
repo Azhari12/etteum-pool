@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  extractHttpStatus,
   isBadUpstreamRequest,
   isContentModerationError,
   isInvalidModelError,
   isNonAccountRequestError,
+  isTransientError,
 } from "../../src/proxy/errors";
 
 describe("proxy error classification", () => {
@@ -42,5 +44,56 @@ describe("proxy error classification", () => {
     expect(isNonAccountRequestError("Content moderation: Your input was flagged")).toBe(true);
     expect(isNonAccountRequestError("flagged as potentially sensitive")).toBe(true);
     expect(isNonAccountRequestError("401 unauthorized")).toBe(false);
+  });
+});
+
+describe("extractHttpStatus", () => {
+  test("reads the status out of every provider's formatting", () => {
+    expect(extractHttpStatus('HTTP 502: <!DOCTYPE html>')).toBe(502);
+    expect(extractHttpStatus("upstream returned (503)")).toBe(503);
+    expect(extractHttpStatus("status 429 from provider")).toBe(429);
+    expect(extractHttpStatus("status code: 500")).toBe(500);
+    expect(extractHttpStatus("HTTP/400 bad request")).toBe(400);
+  });
+
+  test("returns null when there is no status to read", () => {
+    expect(extractHttpStatus(undefined)).toBeNull();
+    expect(extractHttpStatus("")).toBeNull();
+    expect(extractHttpStatus("socket hang up")).toBeNull();
+    // Not a status code — must not be mistaken for one.
+    expect(extractHttpStatus("model deepseek-v3 unavailable")).toBeNull();
+  });
+});
+
+describe("isTransientError", () => {
+  test("classifies upstream 5xx by status regardless of formatting", () => {
+    expect(isTransientError('HTTP 502: <!DOCTYPE html><html>cloudflare</html>')).toBe(true);
+    expect(isTransientError("HTTP 500: internal")).toBe(true);
+    expect(isTransientError("upstream returned (503)")).toBe(true);
+    expect(isTransientError("HTTP 429: slow down")).toBe(true);
+  });
+
+  test("still treats network failures as transient", () => {
+    expect(isTransientError("socket hang up")).toBe(true);
+    expect(isTransientError("fetch failed")).toBe(true);
+    expect(isTransientError("ETIMEDOUT")).toBe(true);
+    expect(isTransientError("Stream read timeout")).toBe(true);
+    expect(isTransientError("Kiro stream error")).toBe(true);
+    expect(isTransientError("CodeBuddy stream failed: boom")).toBe(true);
+  });
+
+  test("does not treat an upstream error message as a stream error", () => {
+    // Regression: the old substring check matched "...upstream error" via
+    // "stream error", so any upstream complaint was silently transient.
+    expect(isTransientError("Hoshi upstream error")).toBe(false);
+    expect(isTransientError("BYOK upstream error for model x")).toBe(false);
+  });
+
+  test("keeps account-level failures out of the transient bucket", () => {
+    expect(isTransientError("HTTP 401: invalid api key")).toBe(false);
+    expect(isTransientError("HTTP 403: forbidden")).toBe(false);
+    expect(isTransientError("HTTP 404: no such endpoint")).toBe(false);
+    expect(isTransientError(undefined)).toBe(false);
+    expect(isTransientError("")).toBe(false);
   });
 });
