@@ -124,10 +124,10 @@ Each provider extends `BaseProvider` and implements:
 
 BYOK (Bring Your Own Key) accounts each declare a `model_prefix` in their `tokens` JSON, plus a list of `models` and a `base_url`. A request for `kuzu-hoshi/deepseek-ai/DeepSeek-V4-Flash` is matched to prefix `kuzu`, then the model sent upstream is the remainder (`hoshi/deepseek-ai/DeepSeek-V4-Flash`).
 
-- `prefixCache: Map<prefix, CachedByokAccount[]>` — built from DB, 10s TTL. Multiple accounts can share a prefix (load-balanced as a group).
+- `prefixCache: Map<prefix, CachedByokAccount[]>` — built from DB, 10s TTL. Multiple accounts can share a prefix (load-balanced as a group). The cache includes `active`, `error`, AND `exhausted` accounts so exhausted keys keep claiming their prefix (otherwise their models fall through to the Kiro fallback and a request that would reactivate the key never reaches it).
 - **Load balancing** per prefix (from `tokens.load_balancing_method`): `round_robin` (default, with least-in-flight tie-break), `sequential`, `least_inflight`.
 - Supports both `openai` (`/chat/completions`) and `anthropic` (`/messages`) upstream formats, auto-detected from `base_url` or explicit `tokens.format`.
-- Account selection tiers (in `findAccountForModel`): active → error → exhausted (one-shot per refresh cycle).
+- Account selection tiers (in `findAccountForModel`): active → error → exhausted (one-shot per refresh cycle). A successful request from the exhausted tier reactivates the key (`markActiveFromExhausted`).
 - `refreshByokModels()` must be called after any BYOK account CRUD so the cache rebuilds.
 
 ### Router (`router.ts`) — `routeRequest(request, stream)`
@@ -163,7 +163,9 @@ The response body includes `error.upstream: { provider, status?, attempts, accou
 
 ## Database
 
-SQLite at `data/poolprox3.db`. Schema in `src/db/schema.ts`. Tables: `accounts`, `request_logs`, `settings`, `usage_summary`, `vcc_cards`, `vcc_transactions`, `image_studio_chats`, `image_studio_results`, `filter_rules`, `proxy_pool`, `model_mappings`.
+SQLite at `data/poolprox3.db`. Schema in `src/db/schema.ts`. Tables: `accounts`, `request_logs`, `settings`, `usage_summary`, `vcc_cards`, `vcc_transactions`, `image_studio_chats`, `image_studio_results`, `filter_rules`, `proxy_pool`, `model_mappings`, `cbc_models`.
+
+**`cbc_models`** — dynamic model catalog for codebuddy-china. Lets the operator add/remove `cbc-*` models from the dashboard (`/models` page → "codebuddy-china — dynamic models" section) without touching provider code. Rows are merged on top of the static `supportedModels` in `codebuddy-china.ts`. Each row: `model_id` (must start `cbc-`), `upstream_model` (sent to codebuddy.cn), context/vision/thinking/credit fields. After any CRUD, `refreshCbcModels()` rebuilds the in-memory cache (`dynamicModels` + `dynamicUpstreamMap`); `resolveModel()` checks the dynamic map before falling back to the static `CBC_MODEL_MAP`. API: `GET/POST /api/models/cbc`, `PUT/DELETE /api/models/cbc/:id`.
 
 **`accounts` table** — key columns: `id`, `provider`, `email`, `password` (encrypted), `tokens` (jsonb — access/refresh tokens, BYOK config), `status`, `enabled`, quota + free-counter fields, `errorMessage`, timestamps.
 

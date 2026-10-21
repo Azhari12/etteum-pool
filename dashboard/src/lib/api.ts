@@ -891,3 +891,43 @@ export async function testByokProvider(
     body: JSON.stringify(model ? { model } : {})
   });
 }
+
+// ─── codebuddy-china dynamic model catalog ──────────────────────────────
+export interface CbcModelDTO {
+  id?: number;
+  modelId: string;
+  upstreamModel: string;
+  label?: string | null;
+  contextWindow?: number;
+  maxOutput?: number;
+  thinking?: boolean;
+  vision?: boolean;
+  creditUnit?: string;
+  creditRate?: number;
+  creditSource?: string;
+  enabled?: boolean;
+}
+
+export async function fetchCbcModels() {
+  return fetchApi<{ data: CbcModelDTO[] }>("/api/models/cbc");
+}
+
+export async function createCbcModel(model: CbcModelDTO) {
+  return fetchApi<{ success: boolean; data: CbcModelDTO }>("/api/models/cbc", {
+    method: "POST",
+    body: JSON.stringify(model),
+  });
+}
+
+export async function updateCbcModel(id: number, model: Partial<CbcModelDTO>) {
+  return fetchApi<{ success: boolean; data: CbcModelDTO | null }>(`/api/models/cbc/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(model),
+  });
+}
+
+export async function deleteCbcModel(id: number) {
+  return fetchApi<{ success: boolean }>(`/api/models/cbc/${id}`, {
+    method: "DELETE",
+  });
+}

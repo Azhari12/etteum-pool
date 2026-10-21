@@ -132,6 +132,52 @@ describe.skipIf(skipReason !== null)(`routeRequest error reporting`, () => {
     ).rejects.toThrow(/No active accounts available for provider: qoder/);
   });
 
+  describe("exhausted reactivation", () => {
+    /**
+     * Regression: BYOK's prefix cache used to skip `status === "exhausted"`
+     * accounts, so an exhausted key's prefix vanished from the router entirely
+     * (model fell through to the Kiro fallback). A request that would have
+     * reactivated the key never reached it. The cache must include exhausted
+     * keys so findAccountForModel's exhausted tier can pick them.
+     */
+    it("BYOK: flips an exhausted account back to active on a successful request", async () => {
+      upstream = Bun.serve({
+        port: 0,
+        fetch: () =>
+          new Response(
+            JSON.stringify({
+              id: "x",
+              object: "chat.completion",
+              choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+      });
+      await seedByokAccount(`http://localhost:${upstream.port}/v1`);
+      await refreshByokModels();
+
+      // Mark the seeded account exhausted.
+      await db.update(accounts).set({ status: "exhausted" }).where(eq(accounts.email, "routertest#default"));
+      await refreshByokModels();
+
+      const [before] = await db
+        .select()
+        .from(accounts)
+        .where(eq(accounts.email, "routertest#default"));
+      expect(before?.status).toBe("exhausted");
+
+      const result = await routeRequest(request(), false);
+      expect(result.result.success).toBe(true);
+
+      const [after] = await db
+        .select()
+        .from(accounts)
+        .where(eq(accounts.email, "routertest#default"));
+      expect(after?.status).toBe("active");
+    });
+  });
+
   describe("HTTP responses", () => {
     async function post(pathname: string, payload: unknown) {
       const response = await proxyRouter.request(pathname, {

@@ -15,7 +15,7 @@ import { sql } from "drizzle-orm";
 import { PUDIDIL_FILTERS } from "./proxy/filters";
 import { loadFilterCache } from "./proxy/filter-cache";
 import { ensureModelMappingTable, seedModelMappings, loadModelMappingCache } from "./proxy/model-mapping";
-import { refreshByokModels, refreshGitlabDuoModels } from "./proxy/providers/registry";
+import { refreshByokModels, refreshGitlabDuoModels, refreshCbcModels } from "./proxy/providers/registry";
 
 // Run database migrations on startup
 await runMigrations();
@@ -68,6 +68,15 @@ try {
   console.log("[GitLab Duo] Cache warmed up successfully");
 } catch (e) {
   console.error("[GitLab Duo] Cache warm-up skipped:", e instanceof Error ? e.message : e);
+}
+
+// Pre-warm codebuddy-china dynamic model catalog (operator-added cbc-* models
+// from the dashboard live in cbc_models; without this they'd be invisible
+// until the first CRUD trigger refreshCbcModels()).
+try {
+  await refreshCbcModels();
+} catch (e) {
+  console.error("[codebuddy-china] Dynamic model cache warm-up skipped:", e instanceof Error ? e.message : e);
 }
 
 // Start auto-warmup scheduler (reads settings from DB)

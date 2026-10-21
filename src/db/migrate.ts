@@ -61,6 +61,36 @@ export async function runMigrations() {
 
   // Always run idempotent column-add migrations (works on fresh deploys without drizzle/).
   await runIdempotentColumns();
+
+  // Ensure codebuddy-china dynamic model catalog exists. Idempotent CREATE —
+  // safe on every boot, same pattern as ensureModelMappingTable.
+  ensureCbcModelsTable();
+}
+
+/**
+ * Create the cbc_models table if it does not exist. The drizzle migration
+ * journal in this repo is inconsistent, so we guarantee the table at runtime
+ * with an idempotent CREATE rather than relying on the migrator alone.
+ */
+export function ensureCbcModelsTable(): void {
+  client.exec(`
+    CREATE TABLE IF NOT EXISTS cbc_models (
+      id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+      model_id text NOT NULL UNIQUE,
+      upstream_model text NOT NULL,
+      label text,
+      context_window integer NOT NULL DEFAULT 200000,
+      max_output integer NOT NULL DEFAULT 8192,
+      thinking integer NOT NULL DEFAULT 0,
+      vision integer NOT NULL DEFAULT 0,
+      credit_unit text NOT NULL DEFAULT 'credit',
+      credit_rate real NOT NULL DEFAULT 0.01,
+      credit_source text NOT NULL DEFAULT 'upstream',
+      enabled integer NOT NULL DEFAULT 1,
+      created_at integer NOT NULL,
+      updated_at integer
+    );
+  `);
 }
 
 // Run if called directly

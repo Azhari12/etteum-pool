@@ -87,6 +87,11 @@ export async function refreshGitlabDuoModels(): Promise<void> {
   await gitlabDuo.refreshModelsCache();
 }
 
+/** Refresh codebuddy-china dynamic model catalog from the cbc_models table. */
+export async function refreshCbcModels(): Promise<void> {
+  await codebuddyChina.refreshModelsCache();
+}
+
 /** Get BYOK provider instance. */
 export function getByokProvider(): ByokProvider {
   return byok;

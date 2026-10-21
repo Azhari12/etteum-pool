@@ -114,25 +114,43 @@ describe("BYOK Provider", () => {
       expect(await provider.ownsModel("disabled-gpt-4")).toBe(false);
     });
 
-    it("should not own models from inactive accounts", async () => {
+    it("still owns models from error and exhausted accounts (keeps prefix claimed)", async () => {
+      // Error and exhausted accounts stay in the prefix cache so their models do
+      // NOT fall through to the fallback provider (Kiro). findAccountForModel
+      // picks active keys first, then error, then exhausted — but only if the
+      // account is in the cache at all. See byok.ts loadFromDb.
       await db.insert(accounts).values({
         provider: "byok",
-        email: "inactive",
+        email: "errored",
         password: encrypt("key"),
-        status: "error", // Not active
+        status: "error",
         enabled: true,
         tokens: JSON.stringify({
           base_url: "https://api.com/v1",
           format: "openai",
           models: ["gpt-4"],
-          model_prefix: "inactive",
+          model_prefix: "errored",
+        }),
+      });
+      await db.insert(accounts).values({
+        provider: "byok",
+        email: "drained",
+        password: encrypt("key"),
+        status: "exhausted",
+        enabled: true,
+        tokens: JSON.stringify({
+          base_url: "https://api.com/v1",
+          format: "openai",
+          models: ["gpt-4"],
+          model_prefix: "drained",
         }),
       });
 
       await refreshByokModels();
 
       const provider = getByokProvider();
-      expect(await provider.ownsModel("inactive-gpt-4")).toBe(false);
+      expect(await provider.ownsModel("errored-gpt-4")).toBe(true);
+      expect(await provider.ownsModel("drained-gpt-4")).toBe(true);
     });
   });
 

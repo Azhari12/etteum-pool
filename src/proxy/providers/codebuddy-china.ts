@@ -10,6 +10,9 @@ import {
 import type { Account } from "../../db/schema";
 import { config } from "../../config";
 import { decodeJwtExp } from "../../utils/jwt";
+import { db } from "../../db/index";
+import { cbcModels } from "../../db/schema";
+import { eq } from "drizzle-orm";
 
 interface CodeBuddyChinaTokens {
   api_key?: string;
@@ -67,6 +70,10 @@ export class CodeBuddyChinaProvider extends BaseProvider {
 
   private resolveModel(model: string): string {
     const base = model.toLowerCase();
+    // Dynamic (DB-backed) mapping takes priority so operator-added models
+    // override the static table without code changes.
+    const dynamic = this.dynamicUpstreamMap.get(base);
+    if (dynamic) return dynamic;
     return CBC_MODEL_MAP[base] || base;
   }
 
@@ -134,6 +141,64 @@ export class CodeBuddyChinaProvider extends BaseProvider {
   /** Cache for resolved tool schemas — the assistant sends the same tools every request */
   private schemaCache = new Map<string, any>();
   private static readonly SCHEMA_CACHE_MAX = 200;
+
+  // ─── Dynamic model catalog (DB-backed) ────────────────────────────────
+  // Models added from the dashboard live in the cbc_models table. They are
+  // merged ON TOP of the static list above so the provider's hardcoded models
+  // are always available; the operator only adds extras.
+  private dynamicModels: ModelInfo[] = [];
+  private dynamicUpstreamMap = new Map<string, string>(); // model_id → upstream_model
+  private dynamicById = new Map<string, ModelInfo>();      // model_id → ModelInfo
+
+  /**
+   * Rebuild the dynamic-model cache from the cbc_models table. Called at boot
+   * and after any CRUD via the models API. Mirrors ByokProvider's refresh.
+   */
+  async refreshModelsCache(): Promise<void> {
+    try {
+      const rows = await db.select().from(cbcModels).where(eq(cbcModels.enabled, true));
+      const models: ModelInfo[] = [];
+      const upstream = new Map<string, string>();
+      const byId = new Map<string, ModelInfo>();
+      for (const row of rows) {
+        const info: ModelInfo = {
+          id: row.modelId,
+          object: "model",
+          created: Math.floor((row.createdAt?.getTime() ?? Date.now()) / 1000),
+          owned_by: "codebuddy-china",
+          context_window: row.contextWindow,
+          max_output: row.maxOutput,
+          thinking: row.thinking,
+          vision: row.vision,
+          creditUnit: row.creditUnit as ModelInfo["creditUnit"],
+          creditRate: row.creditRate,
+          creditSource: row.creditSource as ModelInfo["creditSource"],
+        };
+        models.push(info);
+        byId.set(row.modelId.toLowerCase(), info);
+        upstream.set(row.modelId.toLowerCase(), row.upstreamModel);
+      }
+      this.dynamicModels = models;
+      this.dynamicUpstreamMap = upstream;
+      this.dynamicById = byId;
+    } catch (e) {
+      console.error("[codebuddy-china] refreshModelsCache failed:", e);
+    }
+  }
+
+  override getModels(): ModelInfo[] {
+    // Static first so a dynamic row that happens to duplicate a static id
+    // doesn't shadow the hardcoded definition (getModelInfo returns first hit).
+    return [...this.supportedModels, ...this.dynamicModels];
+  }
+
+  override getModelInfo(model: string): ModelInfo | undefined {
+    const normalized = model.toLowerCase();
+    // Static definitions are authoritative — check them first.
+    const staticHit = this.supportedModels.find((item) => item.id.toLowerCase() === normalized);
+    if (staticHit) return staticHit;
+    return this.dynamicById.get(normalized);
+  }
 
   private getTokens(account: Account): CodeBuddyChinaTokens | null {
     if (!account.tokens) return null;

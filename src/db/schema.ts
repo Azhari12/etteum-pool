@@ -191,6 +191,27 @@ export const modelMappings = sqliteTable("model_mappings", {
   index("model_mappings_priority_idx").on(table.priority),
 ]);
 
+// Dynamic model catalog for codebuddy-china. Lets the operator add/remove
+// cbc-* models from the dashboard without touching provider code. Static
+// models in codebuddy-china.ts always remain available; rows here are merged
+// on top. See src/proxy/providers/codebuddy-china.ts refreshModelsCache().
+export const cbcModels = sqliteTable("cbc_models", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  modelId: text("model_id").notNull().unique(),        // "cbc-glm-5.3" — pool-facing, must start with cbc-
+  upstreamModel: text("upstream_model").notNull(),    // "glm-5.3" — sent to codebuddy.cn
+  label: text("label"),                               // optional display label
+  contextWindow: integer("context_window").notNull().default(200000),
+  maxOutput: integer("max_output").notNull().default(8192),
+  thinking: integer("thinking", { mode: "boolean" }).notNull().default(false),
+  vision: integer("vision", { mode: "boolean" }).notNull().default(false),
+  creditUnit: text("credit_unit").notNull().default("credit"), // token | request | image | credit
+  creditRate: real("credit_rate").notNull().default(0.01),
+  creditSource: text("credit_source").notNull().default("upstream"), // upstream | quota_delta | estimated | fixed
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
 // Type exports
 export type Account = typeof accounts.$inferSelect;
 export type NewAccount = typeof accounts.$inferInsert;
@@ -213,3 +234,5 @@ export type FilterRule = typeof filterRules.$inferSelect;
 export type NewFilterRule = typeof filterRules.$inferInsert;
 export type ModelMapping = typeof modelMappings.$inferSelect;
 export type NewModelMapping = typeof modelMappings.$inferInsert;
+export type CbcModel = typeof cbcModels.$inferSelect;
+export type NewCbcModel = typeof cbcModels.$inferInsert;

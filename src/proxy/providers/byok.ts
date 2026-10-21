@@ -103,10 +103,14 @@ export class ByokProvider extends BaseProvider {
 
     for (const account of byokAccounts) {
       if (!account.enabled) continue;
-      // Include error accounts so routing still claims their prefix.
-      // The router will handle retries/failures; we must not let their
-      // models fall through to the fallback provider (Kiro).
-      if (account.status !== "active" && account.status !== "error") continue;
+      // Include error AND exhausted accounts so routing still claims their
+      // prefix. findAccountForModel tries active keys first, then error, then
+      // exhausted as a one-shot fallback per refresh cycle — but that exhausted
+      // tier can only work if the account is in the cache in the first place.
+      // Excluding exhausted here made exhausted BYOK keys invisible to the
+      // prefix router, so their models fell through to the fallback (Kiro) and
+      // a request that would have reactivated the key never reached it.
+      if (account.status !== "active" && account.status !== "error" && account.status !== "exhausted") continue;
 
       const tokens = this.parseTokens(account.tokens);
       if (!tokens?.base_url || !tokens.models?.length) continue;
