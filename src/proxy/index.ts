@@ -11,7 +11,7 @@ import {
   openAIToAnthropic,
   type AnthropicMessagesRequest,
 } from "./transforms/anthropic";
-import { isBadUpstreamRequest, isInvalidModelError } from "./errors";
+import { isBadUpstreamRequest, isInvalidModelError, isContextOverflowError } from "./errors";
 import { prepareLogBody } from "./logging";
 import { resolveModelAlias } from "./model-mapping";
 import { eq, sql } from "drizzle-orm";
@@ -250,6 +250,21 @@ interface ProxyErrorShape {
  * both: the status the caller should act on, plus the raw upstream text.
  */
 function describeProxyError(error: unknown, errorMessage: string): ProxyErrorShape {
+  // Context overflow is the single most confusing failure to surface raw: the
+  // upstream text is a wall of JSON and the request is deterministic anyway.
+  // Return a short, actionable message instead.
+  if (isContextOverflowError(errorMessage)) {
+    return {
+      message:
+        "Request exceeds the model's context window. Shorten the prompt, remove " +
+        "large attachments, or start a new task. Retrying will not help.",
+      status: 400,
+      type: "invalid_request_error",
+      code: "context_length_exceeded",
+      upstream: { provider: "upstream", attempts: 1, error: errorMessage },
+    };
+  }
+
   const invalidModel = isInvalidModelError(errorMessage);
   const badUpstreamRequest = isBadUpstreamRequest(errorMessage);
 

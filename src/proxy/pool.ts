@@ -1,10 +1,11 @@
 import { db } from "../db/index";
 import { accounts, settings } from "../db/schema";
-import { eq, and, sql, lt } from "drizzle-orm";
+import { eq, and, sql, lt, inArray } from "drizzle-orm";
 import type { Account } from "../db/schema";
 import { broadcast } from "../ws/index";
 import { config } from "../config";
 import { getProviderForModel, type ProviderName } from "./providers/registry";
+import { isAuthFailureError } from "./errors";
 
 export type { ProviderName };
 
@@ -328,17 +329,43 @@ class AccountPool {
     return inFlight;
   }
 
+  /**
+   * Accounts eligible for rotation.
+   *
+   * `active` accounts come first. `error` accounts are ALSO included — a single
+   * failed attempt must not park an account forever, because most failures are
+   * transient upstream/network blips that clear on their own. The ONLY error
+   * that disqualifies an account is a dead session/credential, which needs a
+   * human to log in again; those are excluded until warmup or a manual re-login
+   * clears the error.
+   *
+   * Ordering matters: healthy accounts are tried before previously-failed ones,
+   * so recovery never comes at the cost of worse service for working accounts.
+   */
   private async fetchActiveAccounts(provider: ProviderName): Promise<Account[]> {
-    return db
+    const rows = await db
       .select()
       .from(accounts)
       .where(
         and(
           eq(accounts.provider, provider),
-          eq(accounts.status, "active"),
           eq(accounts.enabled, true),
+          inArray(accounts.status, ["active", "error"]),
         )
       );
+
+    return rows
+      .filter(
+        (row) =>
+          row.status === "active" ||
+          // A dead session can only be fixed by a human re-login — keep it out
+          // of rotation rather than burning attempts on every request.
+          !isAuthFailureError(row.errorMessage ?? undefined)
+      )
+      .sort((a, b) => {
+        if (a.status === b.status) return 0;
+        return a.status === "active" ? -1 : 1;
+      });
   }
 
   /**
@@ -444,9 +471,11 @@ class AccountPool {
   }
 
   /**
-   * Reactivate an account from `exhausted` → `active` based on an ACTUAL
-   * successful request (NOT the quota tracker). Called from the router when a
-   * request served by an exhausted-account fallback succeeds.
+   * Reactivate an account from `exhausted` or `error` → `active` based on an
+   * ACTUAL successful request (NOT the quota tracker). Called from the router
+   * whenever a request served by an exhausted-fallback or a previously-errored
+   * account succeeds — a real success is the strongest possible proof that the
+   * account works again, and it clears the error surfaced in the dashboard.
    */
   async markActiveFromExhausted(accountId: number): Promise<void> {
     // Clear the exhausted-checked stamp on reactivation so a future exhaust
@@ -478,6 +507,18 @@ class AccountPool {
         data: { id: accountId, status: "active", provider: account.provider, reactivated: true },
       });
     }
+  }
+
+  /**
+   * Clear a recoverable `error` state after a successful request.
+   *
+   * Distinct from markActiveFromExhausted only in intent — both flip the row to
+   * active and drop errorMessage — but this one is called for accounts that
+   * were sitting in `error` and just proved they work. Kept as a named alias so
+   * the router reads clearly and future policies can diverge.
+   */
+  async markRecoveredFromError(accountId: number): Promise<void> {
+    await this.markActiveFromExhausted(accountId);
   }
 
   /**

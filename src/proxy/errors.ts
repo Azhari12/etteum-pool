@@ -34,7 +34,37 @@ export function isBadUpstreamRequest(error?: string): boolean {
   const normalized = error.toLowerCase();
   return (
     normalized.includes("improperly formed request") ||
-    normalized.includes("unsupported parameter")
+    normalized.includes("unsupported parameter") ||
+    // Content too large for the model's context window. Deterministic — every
+    // account returns the same rejection, so retrying just burns attempts and
+    // buries the real cause behind "All accounts failed".
+    isContextOverflowError(normalized)
+  );
+}
+
+/**
+ * The request exceeded the model's context window.
+ *
+ * Providers word this differently: CodeBuddy China returns
+ * `"prompt is too long: 1049004 tokens > 1048576 maximum"` (code 11115),
+ * Anthropic returns "prompt is too long", OpenAI "context_length_exceeded".
+ * All are the caller's problem — shorten the prompt, don't switch accounts.
+ */
+export function isContextOverflowError(error?: string): boolean {
+  if (!error) return false;
+  const normalized = error.toLowerCase();
+  return (
+    normalized.includes("prompt is too long") ||
+    normalized.includes("content too long") ||
+    normalized.includes("context_length_exceeded") ||
+    normalized.includes("context length exceeded") ||
+    normalized.includes("maximum context length") ||
+    normalized.includes("exceeds the model limit") ||
+    normalized.includes("exceeds the maximum") ||
+    // "1049004 tokens > 1048576 maximum" — the numeric shape CBC uses.
+    /\d+\s*tokens?\s*>\s*\d+\s*maximum/.test(normalized) ||
+    // CodeBuddy China's numeric error code for oversized prompts.
+    normalized.includes('"code":11115')
   );
 }
 
@@ -48,6 +78,42 @@ export function isContentModerationError(error?: string): boolean {
     error.includes("Content moderation") ||
     error.includes("content_filter") ||
     error.includes("flagged as potentially sensitive")
+  );
+}
+
+/**
+ * Whether a failure means the account's credentials/session are dead and it
+ * needs a human re-login — i.e. it must NOT be offered to the rotation again.
+ *
+ * Every other failure is considered recoverable: the account stays eligible so
+ * a later request can prove it works again (and flip it back to `active`).
+ * Distinguishing these two is what keeps a single transient blip from parking
+ * an account in the `error` state forever.
+ */
+export function isAuthFailureError(error?: string): boolean {
+  if (!error) return false;
+  const normalized = error.toLowerCase();
+  return (
+    // Explicit re-login signals used across the providers.
+    normalized.includes("session expired") ||
+    normalized.includes("re-login required") ||
+    normalized.includes("relogin required") ||
+    normalized.includes("requires re-login") ||
+    normalized.includes("requires browser re-login") ||
+    normalized.includes("login required") ||
+    normalized.includes("token expired") ||
+    normalized.includes("refresh token is invalid") ||
+    normalized.includes("invalid_grant") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("banned") ||
+    // Expired/absent credentials.
+    normalized.includes("no tokens available") ||
+    normalized.includes("no api key available") ||
+    // Credential rejections. 401/403 anywhere in the text.
+    extractHttpStatus(error) === 401 ||
+    extractHttpStatus(error) === 403 ||
+    /\b401\b/.test(normalized) ||
+    /\b403\b/.test(normalized)
   );
 }
 

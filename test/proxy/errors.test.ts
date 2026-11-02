@@ -3,6 +3,7 @@ import {
   extractHttpStatus,
   isBadUpstreamRequest,
   isContentModerationError,
+  isContextOverflowError,
   isInvalidModelError,
   isNonAccountRequestError,
   isTransientError,
@@ -44,6 +45,43 @@ describe("proxy error classification", () => {
     expect(isNonAccountRequestError("Content moderation: Your input was flagged")).toBe(true);
     expect(isNonAccountRequestError("flagged as potentially sensitive")).toBe(true);
     expect(isNonAccountRequestError("401 unauthorized")).toBe(false);
+  });
+});
+
+describe("context overflow classification", () => {
+  // Regression: CodeBuddy China rejects oversized prompts with
+  // `{"code":11115,"msg":"prompt is too long: 1049004 tokens > 1048576 maximum"}`.
+  // That used to fall through to the transient branch, so the router retried the
+  // same deterministic 400 against 3 different accounts and reported
+  // "All accounts failed ... after 3 attempts" instead of a clear client error.
+  const CBC_OVERFLOW =
+    'CodeBuddy China API error (400): {"code":11115,"msg":"prompt is too long: ' +
+    '1049004 tokens > 1048576 maximum","requestId":"17ae25","extError":' +
+    '{"code":"invalid_request_error","type":"invalid_request_error","StatusCode":400}}';
+
+  test("detects overflow across provider wordings", () => {
+    expect(isContextOverflowError(CBC_OVERFLOW)).toBe(true);
+    expect(isContextOverflowError("prompt is too long: 1049004 tokens > 1048576 maximum")).toBe(true);
+    expect(isContextOverflowError("context_length_exceeded")).toBe(true);
+    expect(isContextOverflowError("maximum context length is 200000 tokens")).toBe(true);
+    expect(isContextOverflowError("Content too long. Please shorten it or start a new task")).toBe(true);
+  });
+
+  test("does not flag unrelated errors as overflow", () => {
+    expect(isContextOverflowError(undefined)).toBe(false);
+    expect(isContextOverflowError("")).toBe(false);
+    expect(isContextOverflowError("HTTP 502: bad gateway")).toBe(false);
+    expect(isContextOverflowError("session expired")).toBe(false);
+    expect(isContextOverflowError("unsupported parameter: max_output_tokens")).toBe(false);
+  });
+
+  test("treats overflow as a non-account error so accounts aren't retried", () => {
+    expect(isNonAccountRequestError(CBC_OVERFLOW)).toBe(true);
+  });
+
+  test("still classifies genuine upstream failures as transient", () => {
+    expect(isTransientError("HTTP 502: bad gateway")).toBe(true);
+    expect(isNonAccountRequestError("HTTP 502: bad gateway")).toBe(false);
   });
 });
 

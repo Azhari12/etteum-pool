@@ -11,6 +11,7 @@ import { accounts } from "../../db/schema";
 import { eq } from "drizzle-orm";
 import { config } from "../../config";
 import { decrypt } from "../../utils/crypto";
+import { isAuthFailureError } from "../errors";
 
 /**
  * BYOK (Bring Your Own Key) Provider
@@ -269,8 +270,10 @@ export class ByokProvider extends BaseProvider {
     const entries = this.prefixCache.get(prefix) || [];
     const excluded = options.excludeAccountIds || new Set<number>();
 
-    // Prefer active keys. Error keys remain in the cache only to keep model
-    // ownership claimed; they are tried only if no active key is available.
+    // Prefer active keys. Error keys are tried only when no active key is
+    // available — they stay eligible so a transient failure doesn't park a key
+    // forever, but never ahead of a healthy one. Auth failures are excluded:
+    // a dead session can only be fixed by a human re-login.
     const supportsModel = (entry: CachedByokAccount) => entry.config.models.includes(actualModel);
     const notExcluded = (entry: CachedByokAccount) => !excluded.has(entry.account.id);
     let candidates = entries.filter((entry) =>
@@ -278,8 +281,13 @@ export class ByokProvider extends BaseProvider {
     );
 
     if (candidates.length === 0) {
-      candidates = entries.filter((entry) =>
-        entry.account.enabled && entry.account.status === "error" && supportsModel(entry) && notExcluded(entry)
+      candidates = entries.filter(
+        (entry) =>
+          entry.account.enabled &&
+          entry.account.status === "error" &&
+          supportsModel(entry) &&
+          notExcluded(entry) &&
+          !isAuthFailureError(entry.account.errorMessage ?? undefined)
       );
     }
 

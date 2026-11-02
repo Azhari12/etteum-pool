@@ -145,7 +145,8 @@ BYOK (Bring Your Own Key) accounts each declare a `model_prefix` in their `token
 ### Error classification (`errors.ts`)
 
 - `extractHttpStatus(error)` — pulls an HTTP status out of any provider's formatting (`HTTP 502:`, `(502)`, `status 502`).
-- `isInvalidModelError` / `isBadUpstreamRequest` / `isContentModerationError` → `isNonAccountRequestError` (don't retry, client's fault).
+- `isInvalidModelError` / `isBadUpstreamRequest` / `isContentModerationError` / `isContextOverflowError` → `isNonAccountRequestError` (don't retry, client's fault).
+- `isContextOverflowError` — prompt exceeded the model's context window (`prompt is too long: N tokens > M maximum`, `context_length_exceeded`, CBC code 11115). Deterministic across accounts, so it must stop the retry loop at attempt 1 rather than burn 3 attempts and report "All accounts failed".
 - `isTransientError(error)` — status-code-first (transient statuses: 400, 408, 425, 429, 5xx), then network/stream substrings. 400 is transient *only* via request-shape phrases; genuinely-unrecoverable 400s are caught earlier by `isNonAccountRequestError`. Stream-error patterns are word-anchored (`/\bstream (error|failed)\b/`) so `"upstream error"` isn't accidentally matched.
 
 ### API error responses (`proxy/index.ts`)
@@ -172,7 +173,7 @@ SQLite at `data/poolprox3.db`. Schema in `src/db/schema.ts`. Tables: `accounts`,
 **Account statuses:** `active` | `exhausted` | `error` | `pending`.
 - `active` — in the live rotation pool.
 - `exhausted` — out of credits; retryable as one-shot fallback per refresh cycle, reactivated on a successful request.
-- `error` — last attempt failed non-transiently; still claimable for BYOK ownership, tried after active.
+- `error` — last attempt failed; **still participates in rotation** (active accounts are ordered first) so a transient upstream blip can't park an account forever. The one exception is a dead session/credential: `isAuthFailureError()` (`session expired`, `re-login required`, 401/403, `no tokens`) excludes the account until a human re-logs in. A successful request flips it back to `active` and clears `errorMessage` via `pool.markRecoveredFromError()`, so the dashboard's red badge disappears on its own.
 - `pending` — not yet warmed/logged in.
 
 **Migrations:** `src/db/migrate.ts`. The `drizzle/` folder is gitignored, so file-based migrations only run if present. On fresh deploys, idempotent `ALTER TABLE ... ADD COLUMN` statements (the `IDEMPOTENT_COLUMNS` list) handle new columns. To push schema changes locally: `bunx drizzle-kit push` (config in `drizzle.config.ts`).

@@ -253,11 +253,16 @@ export async function routeRequest(
           await pool.updateTokens(account.id, result.tokens);
         }
         await pool.markUsed(account.id);
-        // Reactivate an account that was served from the exhausted fallback
-        // tier — the request succeeded, so the account is actually usable.
+        // A successful request is the strongest proof the account is usable.
+        // Flip it back to `active` and clear the stale error message so the
+        // dashboard stops showing a failure that no longer applies.
+        //   - exhausted: served from the exhausted-fallback tier
+        //   - error:     was parked after a failure, just proved it works again
         // Driven by real request outcome, NOT by the quota tracker.
         if (account.status === "exhausted") {
           await pool.markActiveFromExhausted(account.id);
+        } else if (account.status === "error") {
+          await pool.markRecoveredFromError(account.id);
         }
         return { result, account, provider: providerName, durationMs, compressionStats };
       }
@@ -330,6 +335,8 @@ export async function routeRequest(
             await pool.markUsed(account.id);
             if (account.status === "exhausted") {
               await pool.markActiveFromExhausted(account.id);
+            } else if (account.status === "error") {
+              await pool.markRecoveredFromError(account.id);
             }
             return {
               result: retryResult,
