@@ -159,6 +159,8 @@ The window is deliberately wide but NOT "refresh on every call": each refresh bu
 
 **Manual override:** `POST /api/accounts/:id/refresh-token` rotates regardless of expiry (dashboard → account row → key icon, disabled for static API keys). It persists the new pair before responding; a persistence failure returns 500 rather than a misleading success, because the old refresh token is already dead upstream.
 
+**Daily check-in (manual only):** `POST /api/accounts/:id/daily-checkin` claims the bonus (`POST https://copilot.tencent.com/v2/billing/meter/daily-checkin`). Two quirks: the body MUST be `{}` (empty body → 400), and a repeat claim returns code `10001` ("今天已签到，请明天再来" = already checked in today), which is reported as `claimed:false` with HTTP 200, not an error. Dashboard: gift icon per account (codebuddy-china only); `GET /api/accounts/checkin-status` greys it out via the `metadata.lastCheckinAt` stamp. That route MUST stay declared before `GET /:id` — Hono matches in registration order.
+
 ### Error classification (`errors.ts`)
 
 - `extractHttpStatus(error)` — pulls an HTTP status out of any provider's formatting (`HTTP 502:`, `(502)`, `status 502`).

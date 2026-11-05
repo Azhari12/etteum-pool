@@ -1749,6 +1749,32 @@ accountsRouter.post("/:id/reveal", async (c) => {
 });
 
 /**
+ * GET /api/accounts/checkin-status - which accounts have been claimed today.
+ *
+ * Reads the `metadata.lastCheckinAt` stamp written by the single-account claim,
+ * so the dashboard can grey out the button without a network call.
+ *
+ * MUST be declared BEFORE `/:id` — Hono matches in registration order, so a
+ * later literal path would be swallowed by the `:id` param route.
+ */
+accountsRouter.get("/checkin-status", async (c) => {
+	const rows = await db
+		.select({ id: accounts.id, metadata: accounts.metadata })
+		.from(accounts)
+		.where(eq(accounts.provider, "codebuddy-china"));
+
+	const today = new Date().toISOString().slice(0, 10);
+	const claimedToday = rows
+		.filter((r) => {
+			const meta = (r.metadata ?? {}) as Record<string, unknown>;
+			return typeof meta.lastCheckinAt === "string" && String(meta.lastCheckinAt).startsWith(today);
+		})
+		.map((r) => r.id);
+
+	return c.json({ today, claimedAccountIds: claimedToday });
+});
+
+/**
  * GET /api/accounts/:id - Get single account
  */
 accountsRouter.get("/:id", async (c) => {
@@ -2672,6 +2698,68 @@ accountsRouter.post("/:id/warmup", async (c) => {
 
 	warmupQueue.enqueue(id);
 	return c.json({ message: "WarmUp queued", accountId: id });
+});
+
+/**
+ * POST /api/accounts/:id/daily-checkin - Claim the daily bonus for one account.
+ *
+ * Manual only — nobody wants a background job spending credits/claims without
+ * the operator asking. Idempotent per day upstream, so clicking twice is safe.
+ */
+accountsRouter.post("/:id/daily-checkin", async (c) => {
+	const id = Number(c.req.param("id"));
+	if (!Number.isFinite(id) || id <= 0) return c.json({ error: "Invalid account id" }, 400);
+
+	const [account] = await db.select().from(accounts).where(eq(accounts.id, id));
+	if (!account) return c.json({ error: "Account not found" }, 404);
+	if (account.provider !== "codebuddy-china") {
+		return c.json({ error: "Daily check-in is only supported for codebuddy-china" }, 400);
+	}
+
+	const provider = providers["codebuddy-china"] as unknown as {
+		dailyCheckin?: (a: typeof account) => Promise<any>;
+	};
+	if (typeof provider.dailyCheckin !== "function") {
+		return c.json({ error: "Check-in not supported by provider" }, 500);
+	}
+
+	const result = await provider.dailyCheckin(account);
+
+	// Stamp the claim date so the dashboard can show "claimed today" without
+	// hitting the network. Only when the claim genuinely happened — an
+	// "already checked in" reply leaves whatever stamp was already there.
+	if (result.success && result.claimed) {
+		try {
+			const meta = { ...((account.metadata ?? {}) as Record<string, unknown>) };
+			meta.lastCheckinAt = new Date().toISOString();
+			if (typeof result.streakDays === "number") meta.checkinStreakDays = result.streakDays;
+			if (typeof result.credit === "number") meta.lastCheckinCredit = result.credit;
+			await db
+				.update(accounts)
+				.set({ metadata: meta, updatedAt: new Date() })
+				.where(eq(accounts.id, id));
+		} catch (err) {
+			// Non-fatal: the claim already succeeded upstream.
+			console.error(`[Accounts] check-in succeeded but stamping metadata failed for #${id}`, err);
+		}
+	}
+
+	broadcast({ type: "account_checkin", data: { id, ...result } });
+
+	if (!result.success) {
+		// Session problems are the account's fault; everything else is upstream.
+		const status = /session expired|401|403/i.test(String(result.error)) ? 400 : 502;
+		return c.json({ error: result.error || "Check-in failed" }, status as 400 | 502);
+	}
+
+	return c.json({
+		success: true,
+		accountId: id,
+		claimed: result.claimed === true,
+		credit: result.credit ?? null,
+		streakDays: result.streakDays ?? null,
+		message: result.error ?? null, // "already checked in" lands here
+	});
 });
 
 /**

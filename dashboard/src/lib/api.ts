@@ -158,6 +158,25 @@ export async function warmupAccount(accountId: number) {
 }
 
 /**
+ * Claim the codebuddy-china daily bonus for one account. Idempotent per day —
+ * a repeat click just reports "already checked in".
+ */
+export async function claimDailyCheckin(accountId: number) {
+  return fetchApi<{
+    success: boolean;
+    accountId: number;
+    claimed: boolean;
+    credit: number | null;
+    streakDays: number | null;
+    message: string | null;
+  }>(`/api/accounts/${accountId}/daily-checkin`, { method: "POST" });
+}
+
+export async function fetchCheckinStatus() {
+  return fetchApi<{ today: string; claimedAccountIds: number[] }>("/api/accounts/checkin-status");
+}
+
+/**
  * Force a token rotation now. The refresh endpoint is single-use, so this
  * invalidates the previous refresh token — the new pair is persisted server
  * side before the call returns.

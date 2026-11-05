@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
-import { ArrowLeft, Search, Trash2, RefreshCw, RotateCcw, ExternalLink, ArrowUpDown, ArrowUp, ArrowDown, CheckCircle2, XCircle, Key, Copy, Eye, EyeOff, Check, FlaskConical, Loader2 } from "lucide-react";
+import { ArrowLeft, Search, Trash2, RefreshCw, RotateCcw, ExternalLink, ArrowUpDown, ArrowUp, ArrowDown, CheckCircle2, XCircle, Key, Copy, Eye, EyeOff, Check, FlaskConical, Loader2, Gift, CalendarCheck } from "lucide-react";
 import { formatDateTimeID } from "@/lib/utils";
 import { useTimedMessage } from "@/hooks/useTimedMessage";
 import { useWsEvent } from "@/hooks/useWebSocket";
@@ -24,6 +24,8 @@ import {
   toggleAllAccounts,
   warmupAccount,
   refreshAccountToken,
+  claimDailyCheckin,
+  fetchCheckinStatus,
   warmupAllAccounts,
 } from "@/lib/api";
 
@@ -384,6 +386,10 @@ export default function AccountList() {
   const [bulkDeleting, setBulkDeleting] = useState(false);
   /** Account currently rotating its token (shows a spinner, blocks double-click). */
   const [refreshingId, setRefreshingId] = useState<number | null>(null);
+  /** Account currently claiming its daily bonus. */
+  const [claimingId, setClaimingId] = useState<number | null>(null);
+  /** Account ids already claimed today (server-side stamp). */
+  const [claimedToday, setClaimedToday] = useState<Set<number>>(new Set());
   // Test dialog state
   const [testDialog, setTestDialog] = useState<{ accountId: number; email: string } | null>(null);
   const [testModels, setTestModels] = useState<Array<{ id: string; vision?: boolean; thinking?: boolean; creditRate?: number }>>([]);
@@ -418,6 +424,15 @@ export default function AccountList() {
     } finally {
       setLoading(false);
     }
+    // Daily check-in state is only meaningful for codebuddy-china.
+    if (provider === "codebuddy-china") {
+      try {
+        const status = await fetchCheckinStatus();
+        setClaimedToday(new Set(status.claimedAccountIds || []));
+      } catch {
+        /* non-fatal — buttons just stay enabled */
+      }
+    }
   }
 
   useEffect(() => { load(); }, [provider]);
@@ -427,6 +442,30 @@ export default function AccountList() {
 
   async function handleWarmup(id: number) {
     try { await warmupAccount(id); showSuccess(`WarmUp queued #${id}`); await load(); } catch (err) { showError(err); }
+  }
+
+  // Claim the daily bonus. Idempotent upstream, so no confirm dialog needed —
+  // a second click just reports "already checked in".
+  async function handleDailyCheckin(id: number) {
+    setClaimingId(id);
+    try {
+      const res = await claimDailyCheckin(id);
+      if (res.claimed) {
+        const parts = [`#${id} check-in berhasil`];
+        if (res.credit != null) parts.push(`+${res.credit} credit`);
+        if (res.streakDays != null) parts.push(`streak ${res.streakDays} hari`);
+        showSuccess(parts.join(" · "));
+        setClaimedToday((prev) => new Set(prev).add(id));
+      } else {
+        showSuccess(`#${id} sudah check-in hari ini`);
+        setClaimedToday((prev) => new Set(prev).add(id));
+      }
+      await load();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setClaimingId(null);
+    }
   }
 
   // Force a token rotation. Confirmed first: the refresh endpoint is
@@ -775,7 +814,7 @@ export default function AccountList() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-[var(--border)]">
-                  <th className="w-10 p-4">
+                  <th className="w-10 px-3 py-3">
                     <input
                       type="checkbox"
                       aria-label="Select all visible accounts"
@@ -785,28 +824,28 @@ export default function AccountList() {
                       onChange={toggleSelectAllVisible}
                     />
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 w-16">
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 w-16">
                     ID
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("email")}>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 cursor-pointer select-none hover:text-[var(--foreground)] max-w-[220px]" onClick={() => handleSort("email")}>
                     <span className="inline-flex items-center">Email<SortIcon column="email" /></span>
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("status")}>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("status")}>
                     <span className="inline-flex items-center">Status<SortIcon column="status" /></span>
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("enabled")}>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("enabled")}>
                     <span className="inline-flex items-center">Enabled<SortIcon column="enabled" /></span>
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)] hidden sm:table-cell" onClick={() => handleSort("credit")}>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 cursor-pointer select-none hover:text-[var(--foreground)] hidden sm:table-cell" onClick={() => handleSort("credit")}>
                     <span className="inline-flex items-center">Credit<SortIcon column="credit" /></span>
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 hidden md:table-cell">
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 hidden md:table-cell">
                     Token Exp
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)] hidden md:table-cell" onClick={() => handleSort("lastLogin")}>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 cursor-pointer select-none hover:text-[var(--foreground)] hidden md:table-cell" onClick={() => handleSort("lastLogin")}>
                     <span className="inline-flex items-center">Last Login<SortIcon column="lastLogin" /></span>
                   </th>
-                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4">Actions</th>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide px-3 py-3 whitespace-nowrap w-px">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -814,7 +853,7 @@ export default function AccountList() {
                   const isEnabled = account.enabled !== false;
                   return (
                   <tr key={account.id} className={`border-b border-[var(--border)] last:border-0 hover:bg-[var(--secondary)]/50 ${selectedIds.has(account.id) ? "bg-[var(--primary)]/[0.04]" : ""} ${isEnabled ? "" : "opacity-50"}`}>
-                    <td className="p-4">
+                    <td className="px-3 py-3">
                       <input
                         type="checkbox"
                         aria-label={`Select ${account.email}`}
@@ -823,20 +862,20 @@ export default function AccountList() {
                         onChange={() => toggleSelect(account.id)}
                       />
                     </td>
-                    <td className="p-4 text-sm font-mono text-[var(--muted-foreground)]">{account.id}</td>
-                    <td className="p-4 text-sm text-[var(--foreground)]">
-                      <div className="inline-flex items-center">
-                        {account.email}
+                    <td className="px-3 py-3 text-sm font-mono text-[var(--muted-foreground)]">{account.id}</td>
+                    <td className="px-3 py-3 text-sm text-[var(--foreground)] max-w-[220px]">
+                      <div className="inline-flex items-center min-w-0 max-w-full">
+                        <span className="truncate" title={account.email}>{account.email}</span>
                         <ApiKeyCell account={account} />
                       </div>
                       {account.errorMessage && <div className="text-xs text-[var(--error)] mt-1 line-clamp-1" title={account.errorMessage}>{account.errorMessage}</div>}
                     </td>
-                    <td className="p-4">
+                    <td className="px-3 py-3">
                       <Badge variant={statusVariants[account.status]} title={account.exhaustedCheckedAt ? `Checked ${formatDate(account.exhaustedCheckedAt)}` : undefined}>
                         {account.status}{account.status === "exhausted" && account.exhaustedCheckedAt ? " (checked)" : ""}
                       </Badge>
                     </td>
-                    <td className="p-4">
+                    <td className="px-3 py-3">
                       <button
                         type="button"
                         role="switch"
@@ -848,7 +887,7 @@ export default function AccountList() {
                         <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isEnabled ? "translate-x-4" : "translate-x-0.5"}`} />
                       </button>
                     </td>
-                    <td className="p-4 text-sm text-[var(--muted-foreground)] hidden sm:table-cell">
+                    <td className="px-3 py-3 text-sm text-[var(--muted-foreground)] hidden sm:table-cell">
                       {account.provider === "codex"
                         ? <CodexQuotaCell codex={account.metadata?.codex_quota} fallbackRemaining={account.quotaRemaining} fallbackLimit={account.quotaLimit} />
                         : account.provider === "qoder"
@@ -862,7 +901,7 @@ export default function AccountList() {
                             )}
                           </span>}
                     </td>
-                    <td className="p-4 text-xs hidden md:table-cell">
+                    <td className="px-3 py-3 text-xs hidden md:table-cell">
                       {(() => {
                         const exp = formatTokenExp(account.tokenExp);
                         if (!exp) return <span className="text-[var(--muted-foreground)]">-</span>;
@@ -876,8 +915,8 @@ export default function AccountList() {
                         );
                       })()}
                     </td>
-                    <td className="p-4 text-xs text-[var(--muted-foreground)] hidden md:table-cell">{formatDate(account.lastLoginAt || account.lastUsedAt)}</td>
-                    <td className="p-4">
+                    <td className="px-3 py-3 text-xs text-[var(--muted-foreground)] hidden md:table-cell">{formatDate(account.lastLoginAt || account.lastUsedAt)}</td>
+                    <td className="px-3 py-3 whitespace-nowrap w-px">
                       <div className="flex gap-1">
                         {(account.provider.startsWith("kiro") || account.provider === "qoder") && (
                           <Button variant="ghost" size="icon" onClick={() => handleOpenPanel(account.id)} title={`Open ${account.provider === "qoder" ? "Qoder" : "Kiro"} Panel`}>
@@ -890,6 +929,25 @@ export default function AccountList() {
                         <Button variant="ghost" size="icon" onClick={() => handleWarmup(account.id)} title="WarmUp">
                           <RefreshCw className="w-4 h-4 text-[var(--warning)]" />
                         </Button>
+                        {account.provider === "codebuddy-china" && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => handleDailyCheckin(account.id)}
+                            disabled={claimingId === account.id || claimedToday.has(account.id)}
+                            title={
+                              claimedToday.has(account.id)
+                                ? "Sudah check-in hari ini"
+                                : "Klaim bonus harian (daily check-in)"
+                            }
+                          >
+                            {claimingId === account.id
+                              ? <Loader2 className="w-4 h-4 animate-spin text-[var(--info)]" />
+                              : claimedToday.has(account.id)
+                                ? <CalendarCheck className="w-4 h-4 text-[var(--muted-foreground)]" />
+                                : <Gift className="w-4 h-4 text-[var(--success)]" />}
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon"

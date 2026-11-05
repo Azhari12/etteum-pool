@@ -941,6 +941,74 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     }
   }
 
+  /**
+   * Claim the daily check-in bonus for one account.
+   *
+   * The body MUST be `{}` — the endpoint 400s on an empty body. It is also
+   * idempotent per day: a second claim returns code 10001
+   * ("今天已签到，请明天再来" = already checked in today), which is a normal
+   * outcome, not a failure.
+   */
+  async dailyCheckin(account: Account): Promise<{
+    success: boolean;
+    claimed?: boolean;
+    credit?: number;
+    streakDays?: number;
+    error?: string;
+  }> {
+    const tokens = this.getTokens(account);
+    if (!tokens) return { success: false, error: "No tokens available" };
+
+    const apiKey = this.getApiKey(tokens);
+    if (!apiKey) return { success: false, error: "No API key available" };
+
+    try {
+      const res = await this.fetchWithTimeout(
+        "https://copilot.tencent.com/v2/billing/meter/daily-checkin",
+        {
+          method: "POST",
+          headers: {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Authorization": `Bearer ${apiKey}`,
+          },
+          body: "{}",
+        },
+        config.providerQuotaTimeoutMs
+      );
+
+      if (res.status === 401 || res.status === 403) {
+        return { success: false, error: "Session expired, re-login required" };
+      }
+
+      const data = await res.json().catch(() => null) as any;
+      if (!data) return { success: false, error: `Check-in failed: HTTP ${res.status}` };
+
+      if (data.code === 0) {
+        return {
+          success: true,
+          claimed: true,
+          credit: typeof data.data?.credit === "number" ? data.data.credit : undefined,
+          streakDays:
+            typeof data.data?.streak_days === "number" ? data.data.streak_days : undefined,
+        };
+      }
+
+      // 10001 = already checked in today. Report as success-but-not-claimed so
+      // the UI can say "already claimed" instead of showing an error.
+      if (data.code === 10001) {
+        return { success: true, claimed: false, error: data.msg || "Already checked in today" };
+      }
+
+      return { success: false, error: `Check-in failed: code ${data.code} ${data.msg ?? ""}`.trim() };
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : "Check-in error" };
+    }
+  }
+
   private async fetchUserResource(tokens: CodeBuddyChinaTokens): Promise<Response> {
     const now = new Date();
     const endDate = new Date(now.getTime() + 365 * 20 * 24 * 60 * 60 * 1000);
