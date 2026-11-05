@@ -624,6 +624,29 @@ class AccountPool {
   }
 
   /**
+   * Persist refreshed tokens AND hand back the updated row.
+   *
+   * The router retries a request with the *in-memory* `account` object, so a
+   * refresh that only wrote to the DB left the retry carrying the expired
+   * token — the auto-refresh silently never worked. Callers must use the
+   * returned account for the retry.
+   */
+  async updateTokensAndReturn(accountId: number, tokens: string): Promise<Account | null> {
+    const [row] = await db
+      .update(accounts)
+      .set({
+        // Stored as a JSON string — same shape the provider's getTokens parses.
+        tokens: tokens as unknown as Account["tokens"],
+        updatedAt: new Date(),
+      })
+      .where(eq(accounts.id, accountId))
+      .returning();
+
+    if (row) this.invalidate(row.provider as ProviderName);
+    return row ?? null;
+  }
+
+  /**
    * Toggle account enabled flag (user-controlled active/inactive).
    */
   async setEnabled(accountId: number, enabled: boolean): Promise<Account | null> {

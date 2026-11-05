@@ -26,6 +26,29 @@ interface CodeBuddyChinaTokens {
   auth_method?: "jwt" | "api_key";
 }
 
+/**
+ * How far ahead of expiry a JWT access token is refreshed (3 days).
+ *
+ * The refresh endpoint is single-use: the old refresh token dies the moment a
+ * new pair is minted. Refreshing on every warmup would burn a token per pass
+ * and risk stranding the account if the write fails, so the window is wide
+ * enough to keep tokens fresh across a multi-day gap between warmups — while
+ * still far from rotating on every pass.
+ */
+const REFRESH_AHEAD_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * Persist a rotated token pair and return the fresh account row.
+ *
+ * Loaded dynamically: the pool imports the provider registry, which imports
+ * this module — a static import here would close that cycle. The dynamic import
+ * is resolved once and cached by the module loader, so this is cheap.
+ */
+async function persistRefreshedTokens(accountId: number, tokens: string): Promise<Account | null> {
+  const { pool } = await import("../pool");
+  return pool.updateTokensAndReturn(accountId, tokens);
+}
+
 /** Map cbc- prefixed model IDs to actual CodeBuddy China API model names. */
 const CBC_MODEL_MAP: Record<string, string> = {
   // Claude
@@ -506,7 +529,9 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     account: Account,
     request: ChatCompletionRequest
   ): Promise<ProviderResult> {
-    const tokens = this.getTokens(account);
+    // Refresh before using the token if it is inside the 3-day window — a busy
+    // account may never pass through warmup.
+    const { tokens } = await this.refreshForRequest(account);
     if (!tokens) return { success: false, error: "No tokens available" };
 
     const apiKey = this.getApiKey(tokens);
@@ -552,7 +577,8 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     account: Account,
     request: ChatCompletionRequest
   ): Promise<ProviderResult> {
-    const tokens = this.getTokens(account);
+    // Same pre-request refresh guard as chatCompletion.
+    const { tokens } = await this.refreshForRequest(account);
     if (!tokens) return { success: false, error: "No tokens available" };
 
     const apiKey = this.getApiKey(tokens);
@@ -582,38 +608,61 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     account: Account
   ): Promise<{ success: boolean; tokens?: string; error?: string }> {
     const tokens = this.getTokens(account);
-    // Only JWT-based accounts (login-response flow) carry a refresh_token and
-    // can renew their access_token via the Keycloak OIDC token endpoint.
+    // Only JWT-based accounts (login-response flow) carry a refresh_token.
     // Static ck_ API keys never expire by refresh and must be re-issued.
     if (!tokens || tokens.auth_method !== "jwt" || !tokens.refresh_token) {
       return { success: false, error: "CodeBuddy China: static API key or no refresh_token — no refresh" };
     }
 
     try {
-      const res = await fetch(
-        "https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/token",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: tokens.refresh_token,
-            client_id: "console", // matches the `azp` claim in issued tokens
-          }),
-        }
-      );
+      // The WorkBuddy plugin refresh endpoint — NOT the Keycloak OIDC token
+      // endpoint under /auth/realms/copilot. Keycloak rejects the refresh grant
+      // with `unauthorized_client` because "console" is a confidential client
+      // and the grant itself is plugin-scoped. This endpoint takes the refresh
+      // token in a HEADER (not the body) and identifies the caller as the
+      // plugin via X-Auth-Refresh-Source.
+      const res = await fetch("https://copilot.tencent.com/v2/plugin/auth/token/refresh", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${tokens.access_token ?? ""}`,
+          "X-Refresh-Token": tokens.refresh_token,
+          "X-Auth-Refresh-Source": "plugin",
+          "X-Domain": "www.codebuddy.cn",
+          "X-User-Id": tokens.uid ?? "",
+          "X-Product": "SaaS",
+          "User-Agent": "WorkBuddy/5.1.7 WorkBuddy/5.1.7 CLI/2.103.3",
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        body: "{}",
+      });
 
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
-        return { success: false, error: `Refresh failed: ${res.status} ${detail}` };
+        return { success: false, error: `Refresh failed: HTTP ${res.status} ${detail.slice(0, 200)}` };
       }
 
       const data = await res.json() as any;
-      const newAccess = data.access_token;
-      if (!newAccess || typeof newAccess !== "string") {
-        return { success: false, error: "Refresh response missing access_token" };
+      if (data?.code !== 0) {
+        return {
+          success: false,
+          error: `Refresh rejected: code=${data?.code} ${data?.msg ?? data?.message ?? ""}`.trim(),
+        };
       }
-      const newRefresh = typeof data.refresh_token === "string" ? data.refresh_token : tokens.refresh_token;
+
+      const newAccess = data?.data?.accessToken;
+      if (!newAccess || typeof newAccess !== "string") {
+        return { success: false, error: "Refresh response missing data.accessToken" };
+      }
+
+      // BOTH tokens rotate. The old refresh token is invalidated by the server,
+      // so the new pair MUST be persisted immediately — the caller
+      // (pool.updateTokens) does this before the request is retried. Losing the
+      // new refresh token would strand the account forever.
+      const newRefresh =
+        typeof data?.data?.refreshToken === "string" && data.data.refreshToken
+          ? data.data.refreshToken
+          : tokens.refresh_token;
       const exp = decodeJwtExp(newAccess);
 
       const newTokens: CodeBuddyChinaTokens = {
@@ -638,7 +687,15 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     quota?: { limit: number; remaining: number; used: number; resetAt?: Date | string | null };
     error?: string;
   }> {
-    const tokens = this.getTokens(account);
+    return this.fetchQuotaWithTokens(this.getTokens(account));
+  }
+
+  /** fetchQuota against an explicit token set (used after an auto-refresh). */
+  private async fetchQuotaWithTokens(tokens: CodeBuddyChinaTokens | null): Promise<{
+    success: boolean;
+    quota?: { limit: number; remaining: number; used: number; resetAt?: Date | string | null };
+    error?: string;
+  }> {
     if (!tokens) return { success: false, error: "No tokens available" };
 
     const apiKey = this.getApiKey(tokens);
@@ -665,18 +722,113 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     }
   }
 
-  override async healthCheck(account: Account): Promise<ProviderHealthResult> {
+  /**
+   * Auto-login: renew a JWT account's tokens when they are expired or about to
+   * be, before judging its health.
+   *
+   * Without this a dead access token is reported as `session_expired` even
+   * though the account holds a perfectly good refresh token — leaving it parked
+   * in `error` (and often disabled) until a human interferes. The rotated pair
+   * is returned so the caller can persist it.
+   */
+  private async autoRefreshIfNeeded(
+    account: Account
+  ): Promise<{ tokens: CodeBuddyChinaTokens | null; refreshed: string | null }> {
     const tokens = this.getTokens(account);
+    if (!tokens || tokens.auth_method !== "jwt" || !tokens.refresh_token) {
+      return { tokens, refreshed: null };
+    }
+
+    // Local-only check — reading `exp` costs nothing, so the request path pays
+    // no latency on the common case.
+    if (!this.needsRefresh(tokens)) return { tokens, refreshed: null };
+
+    const result = await this.refreshToken(account);
+    if (!result.success || !result.tokens) {
+      return { tokens, refreshed: null };
+    }
+    try {
+      return { tokens: JSON.parse(result.tokens) as CodeBuddyChinaTokens, refreshed: result.tokens };
+    } catch {
+      return { tokens, refreshed: null };
+    }
+  }
+
+  /**
+   * Whether an access token is expired, expiring within REFRESH_AHEAD_MS, or
+   * missing entirely. Pure function of the stored expiry — no I/O.
+   *
+   * A token with NO parseable `exp` is treated as needing a refresh: we cannot
+   * prove it is safe, and guessing wrong strands the account. This is what
+   * guarantees no eligible account is silently skipped.
+   */
+  private needsRefresh(tokens: CodeBuddyChinaTokens | null): boolean {
+    if (!tokens || tokens.auth_method !== "jwt" || !tokens.refresh_token) return false;
+    if (!tokens.access_token) return true;
+    if (typeof tokens.exp !== "number" || !Number.isFinite(tokens.exp)) {
+      // Unknown expiry: derive it from the JWT itself when possible.
+      const derived = tokens.access_token ? decodeJwtExp(tokens.access_token) : null;
+      if (derived === null) return true;
+      return derived * 1000 - Date.now() < REFRESH_AHEAD_MS;
+    }
+    return tokens.exp * 1000 - Date.now() < REFRESH_AHEAD_MS;
+  }
+
+  /**
+   * Request-path auto-refresh.
+   *
+   * A busy account may never go through warmup, so relying on healthCheck alone
+   * meant a token could run all the way to expiry (or past the 3-day window)
+   * while serving requests, only refreshing after upstream returned 401. This
+   * applies the same window on every request.
+   *
+   * Returns the tokens to USE for this request (freshly rotated when needed) and
+   * the row to persist, if any. Persistence is done here via the pool so the new
+   * pair is never lost between the rotate and the caller.
+   */
+  private async refreshForRequest(
+    account: Account
+  ): Promise<{ tokens: CodeBuddyChinaTokens | null; account: Account }> {
+    const tokens = this.getTokens(account);
+    if (!this.needsRefresh(tokens)) return { tokens, account };
+
+    const result = await this.refreshToken(account);
+    if (!result.success || !result.tokens) {
+      // Refresh failed (e.g. dead offline session). Fall through with the
+      // existing token — the request will report the real upstream outcome.
+      return { tokens, account };
+    }
+
+    let parsed: CodeBuddyChinaTokens;
+    try {
+      parsed = JSON.parse(result.tokens) as CodeBuddyChinaTokens;
+    } catch {
+      return { tokens, account };
+    }
+
+    // Persist IMMEDIATELY: the previous refresh token is already invalid, so
+    // losing this pair would strand the account permanently.
+    const updated = await persistRefreshedTokens(account.id, result.tokens);
+    return { tokens: parsed, account: updated ?? account };
+  }
+
+  override async healthCheck(account: Account): Promise<ProviderHealthResult> {
+    const { tokens, refreshed } = await this.autoRefreshIfNeeded(account);
     const apiKey = this.getApiKey(tokens || {} as CodeBuddyChinaTokens);
     if (!apiKey) {
       return { kind: "missing_tokens", success: false, error: "No API key available" };
     }
 
+    // Every result carries the refreshed token pair (when one was minted) so
+    // the warmup runner persists it — the old refresh token is now invalid.
+    const withTokens = <T extends ProviderHealthResult>(result: T): T =>
+      refreshed ? { ...result, tokens: refreshed } : result;
+
     // Primary check: fetch real billing data via /v2/billing/meter/get-user-resource
     // This endpoint works with API key and gives us both auth validation AND real credit data.
-    const quota = await this.fetchQuota(account);
+    const quota = await this.fetchQuotaWithTokens(tokens);
     if (quota.success && quota.quota) {
-      return {
+      return withTokens({
         kind: quota.quota.remaining <= 0 ? "exhausted" : "healthy",
         success: true,
         quota: { ...quota.quota, source: "codebuddy-china.get-user-resource" },
@@ -687,16 +839,16 @@ export class CodeBuddyChinaProvider extends BaseProvider {
           credit_capacity_size: quota.quota.limit,
           lastRealBillingSync: new Date().toISOString(),
         },
-      };
+      });
     }
 
     // Billing API failed — check if it's an auth issue or transient error
     if (quota.error?.includes("401") || quota.error?.includes("403")) {
-      return {
+      return withTokens({
         kind: "session_expired",
         success: false,
         error: "CodeBuddy China API key expired or revoked (billing returned 401/403)",
-      };
+      });
     }
 
     // Fallback: validate via chat completions endpoint
@@ -706,26 +858,26 @@ export class CodeBuddyChinaProvider extends BaseProvider {
       // API works but billing failed (transient) — report as healthy with stored quota
       const storedQuota = Number(account.quotaRemaining || 0);
       const storedLimit = Number(account.quotaLimit || 0);
-      return {
+      return withTokens({
         kind: "healthy",
         success: true,
         quota: storedLimit > 0
           ? { limit: storedLimit, remaining: storedQuota, used: storedLimit - storedQuota, source: "tracked" }
           : undefined,
         message: `Billing API transient error (${quota.error}). Using tracked credit: ${storedQuota.toFixed(1)}/${storedLimit.toFixed(1)}`,
-      };
+      });
     }
 
     if (apiStatus === "quota_exhausted") {
-      return { kind: "exhausted", success: true, error: "Provider returned 429 - quota exhausted" };
+      return withTokens({ kind: "exhausted", success: true, error: "Provider returned 429 - quota exhausted" });
     }
 
     // API returned 401/403 - truly expired
-    return {
+    return withTokens({
       kind: "session_expired",
       success: false,
       error: "CodeBuddy China API returned 401/403 - session expired, re-login required",
-    };
+    });
   }
 
   /**

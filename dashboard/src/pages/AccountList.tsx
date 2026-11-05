@@ -23,6 +23,7 @@ import {
   toggleAccountEnabled,
   toggleAllAccounts,
   warmupAccount,
+  refreshAccountToken,
   warmupAllAccounts,
 } from "@/lib/api";
 
@@ -57,6 +58,8 @@ interface Account {
   lastUsedAt?: string | null;
   lastLoginAt?: string | null;
   errorMessage?: string | null;
+  /** Access-token expiry (unix seconds); null for static API keys. */
+  tokenExp?: number | null;
   hasApiKey?: boolean;
   exhaustedCheckedAt?: string | null;
   metadata?: {
@@ -126,6 +129,20 @@ function formatCredit(value?: number | null) {
 function formatDate(value?: string | null) {
   if (!value) return "-";
   return formatDateTimeID(value);
+}
+
+/** Token expiry comes as unix seconds; show a short date, flag when expired. */
+function formatTokenExp(exp?: number | null) {
+  if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
+  const ms = exp * 1000;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+  const expired = ms < Date.now();
+  return {
+    label: date.toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" }),
+    expired,
+    iso: date.toISOString(),
+  };
 }
 
 function formatWindow(seconds: number) {
@@ -365,6 +382,8 @@ export default function AccountList() {
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  /** Account currently rotating its token (shows a spinner, blocks double-click). */
+  const [refreshingId, setRefreshingId] = useState<number | null>(null);
   // Test dialog state
   const [testDialog, setTestDialog] = useState<{ accountId: number; email: string } | null>(null);
   const [testModels, setTestModels] = useState<Array<{ id: string; vision?: boolean; thinking?: boolean; creditRate?: number }>>([]);
@@ -408,6 +427,29 @@ export default function AccountList() {
 
   async function handleWarmup(id: number) {
     try { await warmupAccount(id); showSuccess(`WarmUp queued #${id}`); await load(); } catch (err) { showError(err); }
+  }
+
+  // Force a token rotation. Confirmed first: the refresh endpoint is
+  // single-use, so the old refresh token dies the moment this succeeds.
+  async function handleForceRefresh(id: number, email: string) {
+    const ok = confirm(
+      `Paksa refresh token untuk "${email}"?\n\n` +
+      `Refresh token lama akan langsung tidak berlaku. Token baru disimpan otomatis.`
+    );
+    if (!ok) return;
+    setRefreshingId(id);
+    try {
+      const res = await refreshAccountToken(id);
+      const expLabel = res.exp
+        ? new Date(res.exp * 1000).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" })
+        : "?";
+      showSuccess(`Token #${id} di-refresh, berlaku sampai ${expLabel}`);
+      await load();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setRefreshingId(null);
+    }
   }
 
   async function handleWarmupAll() {
@@ -743,6 +785,9 @@ export default function AccountList() {
                       onChange={toggleSelectAllVisible}
                     />
                   </th>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 w-16">
+                    ID
+                  </th>
                   <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("email")}>
                     <span className="inline-flex items-center">Email<SortIcon column="email" /></span>
                   </th>
@@ -754,6 +799,9 @@ export default function AccountList() {
                   </th>
                   <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)] hidden sm:table-cell" onClick={() => handleSort("credit")}>
                     <span className="inline-flex items-center">Credit<SortIcon column="credit" /></span>
+                  </th>
+                  <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 hidden md:table-cell">
+                    Token Exp
                   </th>
                   <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)] hidden md:table-cell" onClick={() => handleSort("lastLogin")}>
                     <span className="inline-flex items-center">Last Login<SortIcon column="lastLogin" /></span>
@@ -775,6 +823,7 @@ export default function AccountList() {
                         onChange={() => toggleSelect(account.id)}
                       />
                     </td>
+                    <td className="p-4 text-sm font-mono text-[var(--muted-foreground)]">{account.id}</td>
                     <td className="p-4 text-sm text-[var(--foreground)]">
                       <div className="inline-flex items-center">
                         {account.email}
@@ -813,6 +862,20 @@ export default function AccountList() {
                             )}
                           </span>}
                     </td>
+                    <td className="p-4 text-xs hidden md:table-cell">
+                      {(() => {
+                        const exp = formatTokenExp(account.tokenExp);
+                        if (!exp) return <span className="text-[var(--muted-foreground)]">-</span>;
+                        return (
+                          <span
+                            title={exp.iso}
+                            className={exp.expired ? "text-[var(--error)]" : "text-[var(--muted-foreground)]"}
+                          >
+                            {exp.label}{exp.expired ? " (expired)" : ""}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="p-4 text-xs text-[var(--muted-foreground)] hidden md:table-cell">{formatDate(account.lastLoginAt || account.lastUsedAt)}</td>
                     <td className="p-4">
                       <div className="flex gap-1">
@@ -827,6 +890,21 @@ export default function AccountList() {
                         <Button variant="ghost" size="icon" onClick={() => handleWarmup(account.id)} title="WarmUp">
                           <RefreshCw className="w-4 h-4 text-[var(--warning)]" />
                         </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => handleForceRefresh(account.id, account.email)}
+                          disabled={refreshingId === account.id || !account.tokenExp}
+                          title={
+                            account.tokenExp
+                              ? "Force refresh token (rotates the refresh token — old one dies)"
+                              : "No refreshable token (static API key)"
+                          }
+                        >
+                          {refreshingId === account.id
+                            ? <Loader2 className="w-4 h-4 animate-spin text-[var(--info)]" />
+                            : <Key className="w-4 h-4 text-[var(--success)]" />}
+                        </Button>
                         <Button variant="ghost" size="icon" onClick={() => handleLogin(account.id)} title="Queue login" disabled={account.status !== "pending" && account.status !== "error"}>
                           <RotateCcw className="w-4 h-4" />
                         </Button>
@@ -839,7 +917,7 @@ export default function AccountList() {
                   );
                 })}
                 {!loading && filtered.length === 0 && (
-                  <tr><td colSpan={7} className="p-8 text-center text-sm text-[var(--muted-foreground)]">No accounts found</td></tr>
+                  <tr><td colSpan={9} className="p-8 text-center text-sm text-[var(--muted-foreground)]">No accounts found</td></tr>
                 )}
               </tbody>
             </table>

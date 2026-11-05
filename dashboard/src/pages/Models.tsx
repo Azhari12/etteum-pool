@@ -342,6 +342,7 @@ function CbcModelManager() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-[var(--border)] bg-[var(--secondary)]/50">
+                  <th className="text-left py-2 px-4 text-xs font-medium text-[var(--muted-foreground)] uppercase w-16">ID</th>
                   <th className="text-left py-2 px-4 text-xs font-medium text-[var(--muted-foreground)] uppercase">Model ID</th>
                   <th className="text-left py-2 px-4 text-xs font-medium text-[var(--muted-foreground)] uppercase">Upstream</th>
                   <th className="text-left py-2 px-4 text-xs font-medium text-[var(--muted-foreground)] uppercase">Context</th>
@@ -353,6 +354,7 @@ function CbcModelManager() {
               <tbody>
                 {dynamic.map((m) => (
                   <tr key={m.id} className="border-b border-[var(--border)] last:border-b-0 hover:bg-[var(--secondary)]/30">
+                    <td className="py-2 px-4 text-sm font-mono text-[var(--muted-foreground)]">{m.id ?? "-"}</td>
                     <td className="py-2 px-4 text-sm font-medium text-[var(--foreground)]">{m.modelId}</td>
                     <td className="py-2 px-4 text-sm text-[var(--muted-foreground)] font-mono">{m.upstreamModel}</td>
                     <td className="py-2 px-4 text-sm text-[var(--foreground)]">{formatNumber(m.contextWindow)}</td>

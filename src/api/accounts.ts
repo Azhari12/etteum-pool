@@ -19,6 +19,7 @@ import { warmupAccount } from "../auth/warmup-runner";
 import { pool, type ProviderName } from "../proxy/pool";
 import { activateQoderPat } from "../proxy/providers/qoder";
 import { activateYouMindKey } from "../proxy/providers/youmind";
+import { providers } from "../proxy/providers/registry";
 
 export const accountsRouter = new Hono();
 
@@ -228,6 +229,18 @@ accountsRouter.get("/", async (c) => {
 	// API key (only BYOK accounts do — non-BYOK use email/password via auth bot).
 	const sanitized = allAccounts.map((acc) => {
 		const meta = (acc.metadata ?? {}) as Record<string, unknown>;
+		// Surface only the access-token expiry — never the token itself.
+		let tokenExp: number | null = null;
+		if (acc.tokens) {
+			try {
+				const t = typeof acc.tokens === "string" ? JSON.parse(acc.tokens) : acc.tokens;
+				if (typeof (t as Record<string, unknown>)?.exp === "number") {
+					tokenExp = (t as Record<string, number>).exp!;
+				}
+			} catch {
+				/* malformed tokens — leave null */
+			}
+		}
 		return {
 			...acc,
 			password: "***",
@@ -235,6 +248,7 @@ accountsRouter.get("/", async (c) => {
 			metadata: acc.metadata ?? null,
 			hasApiKey: acc.provider === "byok" || acc.provider === "codebuddy-china",
 			exhaustedCheckedAt: typeof meta.exhaustedCheckedAt === "string" ? meta.exhaustedCheckedAt : null,
+			tokenExp,
 		};
 	});
 
@@ -2658,6 +2672,81 @@ accountsRouter.post("/:id/warmup", async (c) => {
 
 	warmupQueue.enqueue(id);
 	return c.json({ message: "WarmUp queued", accountId: id });
+});
+
+/**
+ * POST /api/accounts/:id/refresh-token - Force a token rotation now.
+ *
+ * The automatic path only refreshes when the access token is expired or within
+ * the proactive window, because the refresh endpoint is single-use: every call
+ * invalidates the old refresh token. This endpoint is the manual override for
+ * an operator who wants a fresh token on demand.
+ *
+ * Safety: the new pair is persisted BEFORE responding. If the write fails the
+ * account would be stranded (old refresh token already dead), so a persistence
+ * failure is reported as an error with the recovery detail rather than a 2xx.
+ */
+accountsRouter.post("/:id/refresh-token", async (c) => {
+	const id = Number(c.req.param("id"));
+	if (!Number.isFinite(id) || id <= 0) {
+		return c.json({ error: "Invalid account id" }, 400);
+	}
+
+	const [account] = await db.select().from(accounts).where(eq(accounts.id, id));
+	if (!account) {
+		return c.json({ error: "Account not found" }, 404);
+	}
+
+	const provider = providers[account.provider as keyof typeof providers];
+	if (!provider || typeof provider.refreshToken !== "function") {
+		return c.json({ error: `Provider '${account.provider}' does not support token refresh` }, 400);
+	}
+
+	let result: { success: boolean; tokens?: string; error?: string };
+	try {
+		result = await provider.refreshToken(account);
+	} catch (err) {
+		return c.json(
+			{ error: `Refresh failed: ${err instanceof Error ? err.message : String(err)}` },
+			502
+		);
+	}
+
+	if (!result.success || !result.tokens) {
+		return c.json({ error: result.error || "Refresh failed" }, 400);
+	}
+
+	// Persist immediately — the old refresh token is already dead upstream.
+	let persisted: unknown;
+	try {
+		persisted = JSON.parse(result.tokens);
+	} catch {
+		persisted = result.tokens;
+	}
+	try {
+		await db
+			.update(accounts)
+			.set({ tokens: persisted, updatedAt: new Date() })
+			.where(eq(accounts.id, id));
+	} catch (err) {
+		// Loud on purpose: the account now holds a dead refresh token in the DB.
+		console.error(`[Accounts] CRITICAL: refreshed #${id} but failed to persist tokens`, err);
+		return c.json(
+			{
+				error:
+					"Token was rotated upstream but could not be saved. Re-add this account immediately — " +
+					"the previous refresh token is no longer valid.",
+				accountId: id,
+			},
+			500
+		);
+	}
+
+	pool.invalidate(account.provider as any);
+	broadcast({ type: "account_status", data: { id, provider: account.provider, refreshed: true } });
+
+	const exp = persisted && typeof (persisted as any).exp === "number" ? (persisted as any).exp : null;
+	return c.json({ success: true, accountId: id, exp });
 });
 
 const CODEX_ISSUER = "https://auth.openai.com";

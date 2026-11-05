@@ -35,6 +35,12 @@ interface AccountWarmupUpdate {
   freeResetAt?: Date | null;
   tokens?: unknown;
   metadata: unknown;
+  /**
+   * Set true when a previously disabled account proved healthy again, so the
+   * warmup can re-enable it automatically. Undefined leaves `enabled` alone —
+   * disabling an account is otherwise a manual operator decision.
+   */
+  enabled?: boolean;
 }
 
 // ============================================================================
@@ -253,12 +259,16 @@ export function mapHealthToAccountUpdate(account: Account, health: ProviderHealt
 
   let status: AccountStatus = account.status;
   let errorMessage: string | null = account.errorMessage || null;
+  let enabled: boolean | undefined;
 
   switch (health.kind) {
     case "healthy":
       if (!policy.skipStatusUpdate) {
         status = "active";
         errorMessage = null;
+        // An account disabled because its session died gets re-enabled once it
+        // proves healthy again — no manual toggle needed.
+        if (!account.enabled) enabled = true;
       }
       break;
     case "exhausted":
@@ -298,6 +308,7 @@ export function mapHealthToAccountUpdate(account: Account, health: ProviderHealt
     errorMessage,
     metadata: mergeWarmupMetadata(account, health),
   };
+  if (enabled !== undefined) update.enabled = enabled;
 
   if (!policy.skipQuotaColumns) {
     // Qoder is the source of truth — we just mirror what it says, period.
@@ -661,6 +672,7 @@ export async function warmupAccount(account: Account): Promise<WarmupResult> {
   if (update.freeRemaining !== undefined) dbUpdate.freeRemaining = update.freeRemaining;
   if (update.freeResetAt !== undefined) dbUpdate.freeResetAt = update.freeResetAt;
   if (update.tokens !== undefined) dbUpdate.tokens = update.tokens;
+  if (update.enabled !== undefined) dbUpdate.enabled = update.enabled;
 
   await db.update(accounts).set(dbUpdate).where(eq(accounts.id, account.id));
   pool.invalidate(account.provider as ProviderName);

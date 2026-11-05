@@ -142,6 +142,23 @@ BYOK (Bring Your Own Key) accounts each declare a `model_prefix` in their `token
 4. If every account failed → throws **`AllAccountsFailedError`** carrying `{ provider, upstreamError, upstreamStatus, rateLimited, quotaExhausted, attempts, lastAccountEmail }`.
 5. If no candidate was ever found (attempt 0, no account) → throws `No active accounts available for provider: X`.
 
+### Auto-login (token refresh)
+
+`routeRequest` retries with a fresh account row after a refresh, and `healthCheck` can refresh proactively — both rely on `pool.updateTokensAndReturn()`, which persists the new tokens **and returns the updated row**. Refreshing only in the DB left the retry carrying the expired token in memory, so auto-refresh silently never worked.
+
+**codebuddy-china** refreshes via the WorkBuddy plugin endpoint `POST https://copilot.tencent.com/v2/plugin/auth/token/refresh` — the refresh token goes in the `X-Refresh-Token` header, with `X-Auth-Refresh-Source: plugin`, `X-Domain`, `X-User-Id`, and a `WorkBuddy/...` User-Agent; body is `{}`. NOT the Keycloak OIDC endpoint (`/auth/realms/copilot/.../token`), which rejects the grant with `unauthorized_client`. **Both tokens rotate** — the old refresh token dies, so the new pair must be persisted immediately or the account is lost.
+
+The 3-day window (`REFRESH_AHEAD_MS`) is enforced on **both** paths, because a busy account may never pass through warmup:
+
+- **Warmup** — `autoRefreshIfNeeded()` at the top of `healthCheck`, returning the rotated pair via `ProviderHealthResult.tokens` for warmup to persist.
+- **Request** — `refreshForRequest()` at the top of `chatCompletion` / `chatCompletionStream`. It persists through `pool.updateTokensAndReturn()` *before* the request is sent, so a rotated pair is never lost.
+
+The decision lives in one place, `needsRefresh()`, which is pure (reads `exp` only, no I/O) so the common case costs no latency. Rules: refresh when expired, inside 3 days, or when the access token is missing. If `exp` is absent it is derived from the JWT itself; if that also fails, the token is treated as needing a refresh — unknown must never be assumed safe. Static API keys and JWT accounts without a `refresh_token` are never refreshed.
+
+The window is deliberately wide but NOT "refresh on every call": each refresh burns the old refresh token, so a tighter cadence risks stranding accounts.
+
+**Manual override:** `POST /api/accounts/:id/refresh-token` rotates regardless of expiry (dashboard → account row → key icon, disabled for static API keys). It persists the new pair before responding; a persistence failure returns 500 rather than a misleading success, because the old refresh token is already dead upstream.
+
 ### Error classification (`errors.ts`)
 
 - `extractHttpStatus(error)` — pulls an HTTP status out of any provider's formatting (`HTTP 502:`, `(502)`, `status 502`).
@@ -186,7 +203,7 @@ Reduces input tokens before forwarding upstream. Runs in <10ms, non-fatal (on fa
 
 Most providers need browser-based login to capture session tokens. `scripts/auth/login.py` (Python, Playwright/Camoufox) is spawned per-account by `src/auth/runner.ts` via a queue. Provider-specific login flows live in `scripts/auth/app/providers/` (kiro, codebuddy, qoder, canva, codex, gitlab_duo, kiro_pro, wavespeed, yepapi...). Default browser engine is Camoufox (anti-detect); `chromium` is the alternative.
 
-**Warmup** (`src/auth/warmup-runner.ts`, `warmup-scheduler.ts`): periodically refreshes each account's quota/health from upstream and flips statuses (e.g. Qoder re-syncs `freeRemaining` from `/activity`; exhausted accounts get reactivated when upstream reports credits again). `autoWarmupScheduler` starts on boot.
+**Warmup** (`src/auth/warmup-runner.ts`, `warmup-scheduler.ts`): periodically refreshes each account's quota/health from upstream and flips statuses (e.g. Qoder re-syncs `freeRemaining` from `/activity`; exhausted accounts get reactivated when upstream reports credits again). `autoWarmupScheduler` starts on boot. Warmup scans `active`, `exhausted`, AND `error` accounts regardless of `enabled`, so a disabled account whose session died can heal: on `healthy` it sets `status: active` **and** `enabled: true` (`AccountWarmupUpdate.enabled`), clearing the error without a manual toggle.
 
 ## Dashboard (`dashboard/`)
 

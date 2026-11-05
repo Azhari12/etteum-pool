@@ -157,6 +157,18 @@ export async function warmupAccount(accountId: number) {
   });
 }
 
+/**
+ * Force a token rotation now. The refresh endpoint is single-use, so this
+ * invalidates the previous refresh token — the new pair is persisted server
+ * side before the call returns.
+ */
+export async function refreshAccountToken(accountId: number) {
+  return fetchApi<{ success: boolean; accountId: number; exp: number | null }>(
+    `/api/accounts/${accountId}/refresh-token`,
+    { method: "POST" }
+  );
+}
+
 export async function warmupAccounts(accountIds: number[]) {
   return fetchApi("/api/auth/warmup-bulk", {
     method: "POST",

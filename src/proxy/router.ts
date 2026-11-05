@@ -316,14 +316,12 @@ export async function routeRequest(
       ) {
         const refreshResult = await provider.refreshToken(account);
         if (refreshResult.success && refreshResult.tokens) {
-          // Parse tokens string to store as jsonb
-          let parsedTokens: unknown;
-          try {
-            parsedTokens = JSON.parse(refreshResult.tokens);
-          } catch {
-            parsedTokens = refreshResult.tokens;
-          }
-          await pool.updateTokens(account.id, parsedTokens);
+          // Persist the rotated tokens and swap in the FRESH account row before
+          // retrying. Refreshing only in the DB left the retry carrying the
+          // expired token, so auto-refresh never actually worked.
+          const refreshedAccount =
+            (await pool.updateTokensAndReturn(account.id, refreshResult.tokens)) ?? account;
+          account = refreshedAccount;
           // Retry with same account after refresh
           pool.trackRequestStart(account.id);
           tracked = true;
