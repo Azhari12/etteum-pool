@@ -113,7 +113,38 @@ export function isAuthFailureError(error?: string): boolean {
     extractHttpStatus(error) === 401 ||
     extractHttpStatus(error) === 403 ||
     /\b401\b/.test(normalized) ||
-    /\b403\b/.test(normalized)
+    /\b403\b/.test(normalized) ||
+    // Account-level anti-abuse restriction (e.g. CodeBuddy CN code 11140
+    // "request illegal" / "restricted due to unusual activity"). Re-login
+    // cannot fix it, so keep the account out of rotation until a human
+    // resolves the restriction — but the error message tells them so.
+    normalized.includes("restricted by") ||
+    normalized.includes("account restricted") ||
+    /\b1114[01]\b/.test(normalized)
+  );
+}
+
+/**
+ * Whether the failure is an ACCOUNT-LEVEL restriction by the upstream
+ * (anti-abuse / policy), e.g. CodeBuddy CN code 11140 "request illegal" with
+ * "Your account has been restricted due to unusual activity".
+ *
+ * These must not merely be retried or re-logged — the account is unusable
+ * until a human resolves it upstream. The router auto-disables such accounts
+ * (status=error, enabled=false) and persists the reason so the dashboard
+ * shows it.
+ */
+export function isAccountRestrictedError(error?: string): boolean {
+  if (!error) return false;
+  const normalized = error.toLowerCase();
+  return (
+    normalized.includes("restricted by") ||
+    normalized.includes("account restricted") ||
+    normalized.includes("has been restricted") ||
+    normalized.includes("unusual activity") ||
+    normalized.includes("异常行为") ||
+    normalized.includes("已被限制") ||
+    /\b1114[01]\b/.test(normalized)
   );
 }
 

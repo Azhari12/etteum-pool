@@ -254,6 +254,61 @@ export class CodeBuddyChinaProvider extends BaseProvider {
   }
 
   /**
+   * Classify a 401/403 auth response from an inference endpoint.
+   *
+   * Not every 403 means "session expired". CodeBuddy CN returns 403 with
+   * code 11140 ("request illegal" / "Your account has been restricted due to
+   * unusual activity") when it has anti-abuse-restricted the ACCOUNT. Relogging
+   * cannot fix that — the restriction lives on the account, not the session —
+   * yet a flat 401||403 → "Session expired" message made operators relog in
+   * vain while the router treated it as a dead session (excluding the account
+   * from rotation under a misleading reason).
+   *
+   * Reads the (small, JSON) error body ONCE and returns a precise error plus a
+   * `restricted` flag so callers can avoid the misleading "re-login" advice.
+   */
+  private async classifyAuthResponse(
+    response: Response
+  ): Promise<{ error: string; restricted: boolean }> {
+    let bodyText = "";
+    try {
+      bodyText = await response.text();
+    } catch {
+      /* body unreadable — fall through to status-only classification */
+    }
+
+    // Anti-abuse restriction: explicit upstream message or code 11140/11141.
+    const looksRestricted =
+      /request illegal|restricted|unusual activity|异常行为|已被限制/i.test(bodyText) ||
+      /"code"\s*:\s*1114[01]/.test(bodyText);
+
+    if (looksRestricted) {
+      let detail = "";
+      try {
+        const parsed = JSON.parse(bodyText);
+        detail = parsed?.displayMsg?.en || parsed?.msg || "";
+      } catch {
+        /* keep bodyText slice */
+      }
+      return {
+        error:
+          `Account restricted by CodeBuddy China (anti-abuse): ` +
+          `${detail || bodyText.slice(0, 200) || `HTTP ${response.status}`} — ` +
+          `re-login will NOT fix this; appeal via CodeBuddy CN feedback.`,
+        restricted: true,
+      };
+    }
+
+    // Genuine auth failure — token invalid/revoked.
+    return {
+      error: response.status === 401
+        ? "Session expired, re-login required"
+        : `CodeBuddy China rejected the request (HTTP ${response.status})${bodyText ? `: ${bodyText.slice(0, 200)}` : ""}`,
+      restricted: false,
+    };
+  }
+
+  /**
    * Clean messages: convert Anthropic-format content blocks (tool_use, tool_result)
    * to OpenAI-format (tool_calls, tool messages). Also handle agent system prompt
    * detection and replacement.
@@ -542,7 +597,8 @@ export class CodeBuddyChinaProvider extends BaseProvider {
       const response = await this.makeRequest(apiKey, request, true);
 
       if (response.status === 401 || response.status === 403) {
-        return { success: false, error: "Session expired, re-login required" };
+        const classified = await this.classifyAuthResponse(response);
+        return { success: false, error: classified.error };
       }
       if (response.status === 429) {
         return { success: false, error: "Rate limited / quota exhausted", quotaExhausted: true };
@@ -588,7 +644,8 @@ export class CodeBuddyChinaProvider extends BaseProvider {
       const response = await this.makeRequest(apiKey, request, true);
 
       if (response.status === 401 || response.status === 403) {
-        return { success: false, error: "Session expired" };
+        const classified = await this.classifyAuthResponse(response);
+        return { success: false, error: classified.error };
       }
       if (response.status === 429) {
         return { success: false, error: "Rate limited", quotaExhausted: true };
@@ -981,7 +1038,17 @@ export class CodeBuddyChinaProvider extends BaseProvider {
       );
 
       if (res.status === 401 || res.status === 403) {
-        return { success: false, error: "Session expired, re-login required" };
+        // On the refresh endpoint a 401/403 genuinely means the refresh token
+        // is dead (both tokens rotate) — but surface the upstream detail and
+        // detect the account-restricted case too, since a restricted account
+        // cannot be revived by re-login.
+        const classified = await this.classifyAuthResponse(res);
+        return {
+          success: false,
+          error: classified.restricted
+            ? classified.error
+            : "Session expired, re-login required",
+        };
       }
 
       const data = await res.json().catch(() => null) as any;

@@ -591,6 +591,44 @@ class AccountPool {
     });
   }
 
+  /**
+   * Mark an account as error AND disable it.
+   *
+   * Used for account-level anti-abuse restrictions (e.g. CodeBuddy CN code
+   * 11140 "request illegal" / "restricted due to unusual activity"). These
+   * cannot be fixed by a re-login, so the account must leave the rotation
+   * automatically — staying enabled would keep hammering a restricted account
+   * (more abuse signals) and waste retries on every request.
+   *
+   * The error message is persisted so the dashboard shows WHY it was disabled;
+   * an operator re-enables it manually once the restriction is resolved.
+   */
+  async markDisabledWithError(accountId: number, errorMessage: string): Promise<void> {
+    const [account] = await db
+      .update(accounts)
+      .set({
+        status: "error",
+        errorMessage,
+        enabled: false,
+        updatedAt: new Date(),
+      })
+      .where(eq(accounts.id, accountId))
+      .returning();
+
+    if (account) this.invalidate(account.provider as ProviderName);
+
+    broadcast({
+      type: "account_status",
+      data: {
+        id: accountId,
+        status: "error",
+        enabled: false,
+        error: errorMessage,
+        autoDisabled: true,
+      },
+    });
+  }
+
   async markTransientFailure(accountId: number, errorMessage: string): Promise<void> {
     const [account] = await db
       .update(accounts)

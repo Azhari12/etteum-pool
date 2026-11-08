@@ -1,6 +1,6 @@
 import type { ChatCompletionRequest, ProviderResult } from "./providers/base";
 import { providers, getAllModels, type ProviderName } from "./providers/registry";
-import { isNonAccountRequestError, isTransientError, extractHttpStatus } from "./errors";
+import { isNonAccountRequestError, isTransientError, extractHttpStatus, isAccountRestrictedError } from "./errors";
 import { applyPudidilFilters } from "./filters";
 import { pool } from "./pool";
 import type { Account } from "../db/schema";
@@ -309,44 +309,30 @@ export async function routeRequest(
         continue; // Try next account
       }
 
-      // Handle token refresh
+      // Account-level restriction takes priority over any "refresh and retry"
+      // logic: the credentials are fine, the ACCOUNT is blocked upstream, so a
+      // refresh/relogin is pointless. Disable it and move on.
+      if (isAccountRestrictedError(result.error)) {
+        await pool.markDisabledWithError(account.id, result.error || "Account restricted upstream");
+        lastError = result.error || "Account restricted upstream";
+        continue; // Try next account
+      }
+
+      // Token expiry / auth rejection.
+      //
+      // Refresh is deliberately NOT triggered here. Refresh/relogin has exactly
+      // two legitimate entry points, and an error response is neither of them:
+      //   1. Operator force-refresh (POST /api/accounts/:id/refresh-token).
+      //   2. Request-path pre-flight (provider.refreshForRequest) which rotates
+      //      only when the token expires within REFRESH_AHEAD_MS (3 days).
+      // A 401 here means the token is ALREADY dead — the pre-flight window
+      // failed to cover it (rotated elsewhere / revoked upstream), and each
+      // refresh burns a single-use refresh token. So treat it as a failed
+      // attempt and surface the real error instead of silently rotating.
       if (
         result.error?.includes("expired") ||
         result.error?.includes("401")
       ) {
-        const refreshResult = await provider.refreshToken(account);
-        if (refreshResult.success && refreshResult.tokens) {
-          // Persist the rotated tokens and swap in the FRESH account row before
-          // retrying. Refreshing only in the DB left the retry carrying the
-          // expired token, so auto-refresh never actually worked.
-          const refreshedAccount =
-            (await pool.updateTokensAndReturn(account.id, refreshResult.tokens)) ?? account;
-          account = refreshedAccount;
-          // Retry with same account after refresh
-          pool.trackRequestStart(account.id);
-          tracked = true;
-          const retryResult = stream
-            ? await provider.chatCompletionStream(account, compressedRequest)
-            : await provider.chatCompletion(account, compressedRequest);
-
-          if (retryResult.success) {
-            await pool.markUsed(account.id);
-            if (account.status === "exhausted") {
-              await pool.markActiveFromExhausted(account.id);
-            } else if (account.status === "error") {
-              await pool.markRecoveredFromError(account.id);
-            }
-            return {
-              result: retryResult,
-              account,
-              provider: providerName,
-              durationMs: Date.now() - startTime,
-              compressionStats,
-            };
-          }
-          pool.trackRequestEnd(account.id);
-          tracked = false;
-        }
         await pool.markTransientFailure(account.id, result.error || "Auth failed");
         lastError = result.error || "Auth failed";
         continue;
@@ -355,6 +341,11 @@ export async function routeRequest(
       // Generic error - check if transient (network/timeout) or permanent
       if (isTransientError(result.error || "")) {
         await pool.markTransientFailure(account.id, result.error || "Transient error");
+      } else if (isAccountRestrictedError(result.error)) {
+        // Account-level anti-abuse restriction: unusable until resolved
+        // upstream. Disable it (not just mark error) so it leaves the rotation
+        // automatically and stops generating more abuse signals.
+        await pool.markDisabledWithError(account.id, result.error || "Account restricted upstream");
       } else {
         await pool.markError(account.id, result.error || "Unknown error");
       }
@@ -376,6 +367,8 @@ export async function routeRequest(
         await pool.markTransientFailure(account.id, errMsg);
       } else if (isTransientError(errMsg)) {
         await pool.markTransientFailure(account.id, errMsg);
+      } else if (isAccountRestrictedError(errMsg)) {
+        await pool.markDisabledWithError(account.id, errMsg);
       } else {
         await pool.markError(account.id, errMsg);
       }
